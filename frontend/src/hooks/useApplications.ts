@@ -1,4 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+
+import { useTenantQueryScope } from '@/hooks/useTenantQueryScope';
 import * as appService from '@/services/applicationService';
 import type {
   ApplicationCreate,
@@ -10,16 +12,18 @@ const APPS_KEY = ['applications'] as const;
 
 /** Fetch paginated application listings. */
 export function useApplications(page = 1, pageSize = 20, status?: string) {
+  const scope = useTenantQueryScope();
   return useQuery({
-    queryKey: [...APPS_KEY, 'list', page, pageSize, status],
+    queryKey: [...scope, ...APPS_KEY, 'list', page, pageSize, status],
     queryFn: () => appService.listApplications(page, pageSize, status),
   });
 }
 
 /** Fetch a single application by ID. */
 export function useApplication(appId: string | undefined) {
+  const scope = useTenantQueryScope();
   return useQuery({
-    queryKey: [...APPS_KEY, 'detail', appId],
+    queryKey: [...scope, ...APPS_KEY, 'detail', appId],
     queryFn: () => appService.getApplication(appId!),
     enabled: !!appId,
   });
@@ -28,10 +32,11 @@ export function useApplication(appId: string | undefined) {
 /** Create a single application. */
 export function useCreateApplication() {
   const queryClient = useQueryClient();
+  const scope = useTenantQueryScope();
   return useMutation({
     mutationFn: (data: ApplicationCreate) => appService.createApplication(data),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: APPS_KEY });
+      void queryClient.invalidateQueries({ queryKey: [...scope, ...APPS_KEY] });
     },
   });
 }
@@ -39,10 +44,11 @@ export function useCreateApplication() {
 /** Batch create applications. */
 export function useBatchCreateApplications() {
   const queryClient = useQueryClient();
+  const scope = useTenantQueryScope();
   return useMutation({
     mutationFn: (data: ApplicationBatchCreate) => appService.batchCreateApplications(data),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: APPS_KEY });
+      void queryClient.invalidateQueries({ queryKey: [...scope, ...APPS_KEY] });
     },
   });
 }
@@ -50,10 +56,11 @@ export function useBatchCreateApplications() {
 /** Approve a pending application. */
 export function useApproveApplication() {
   const queryClient = useQueryClient();
+  const scope = useTenantQueryScope();
   return useMutation({
     mutationFn: (appId: string) => appService.approveApplication(appId),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: APPS_KEY });
+      void queryClient.invalidateQueries({ queryKey: [...scope, ...APPS_KEY] });
     },
   });
 }
@@ -61,11 +68,12 @@ export function useApproveApplication() {
 /** Update an application's status. */
 export function useUpdateApplicationStatus() {
   const queryClient = useQueryClient();
+  const scope = useTenantQueryScope();
   return useMutation({
     mutationFn: ({ appId, update }: { appId: string; update: ApplicationStatusUpdate }) =>
       appService.updateApplicationStatus(appId, update),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: APPS_KEY });
+      void queryClient.invalidateQueries({ queryKey: [...scope, ...APPS_KEY] });
     },
   });
 }

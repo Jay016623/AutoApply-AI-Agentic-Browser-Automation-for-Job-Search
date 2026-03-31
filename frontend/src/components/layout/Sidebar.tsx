@@ -17,8 +17,11 @@ import DescriptionIcon from '@mui/icons-material/Description';
 import BarChartIcon from '@mui/icons-material/BarChart';
 import SettingsIcon from '@mui/icons-material/Settings';
 import SmartToyIcon from '@mui/icons-material/SmartToy';
+import FactCheckIcon from '@mui/icons-material/FactCheck';
 
 import { useAppStore } from '@/store/useAppStore';
+import { hasAnyRole } from '@/services/authz';
+import type { SessionRole } from '@/types/session';
 
 export const DRAWER_WIDTH = 260;
 
@@ -26,6 +29,7 @@ interface NavItem {
   label: string;
   path: string;
   icon: React.ReactElement;
+  roles?: SessionRole[];
 }
 
 const NAV_ITEMS: NavItem[] = [
@@ -35,6 +39,12 @@ const NAV_ITEMS: NavItem[] = [
   { label: 'Applications', path: '/applications', icon: <SendIcon /> },
   { label: 'Resumes', path: '/resumes', icon: <DescriptionIcon /> },
   { label: 'Analytics', path: '/analytics', icon: <BarChartIcon /> },
+  {
+    label: 'Operations Queue',
+    path: '/operations',
+    icon: <FactCheckIcon />,
+    roles: ['operator', 'admin', 'owner'],
+  },
   { label: 'Settings', path: '/settings', icon: <SettingsIcon /> },
 ];
 
@@ -43,18 +53,33 @@ function Sidebar() {
   const navigate = useNavigate();
   const sidebarOpen = useAppStore((s) => s.sidebarOpen);
   const setSidebarOpen = useAppStore((s) => s.setSidebarOpen);
+  const tenantId = useAppStore((s) => s.authTenantId);
+  const role = useAppStore((s) => s.authRole);
 
   const drawerContent = (
     <Box>
-      <Toolbar sx={{ px: 2 }}>
-        <SmartToyIcon color="primary" sx={{ mr: 1.5 }} />
-        <Typography variant="h6" noWrap color="primary">
-          AutoApply AI
-        </Typography>
+      <Toolbar sx={{ px: 2, justifyContent: 'space-between' }}>
+        <Box sx={{ display: 'flex', alignItems: 'center' }}>
+          <SmartToyIcon color="primary" sx={{ mr: 1.5 }} />
+          <Typography variant="h6" noWrap color="primary">
+            AutoApply AI
+          </Typography>
+        </Box>
       </Toolbar>
+      <Box sx={{ px: 2, pb: 1 }}>
+        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+          Tenant
+        </Typography>
+        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+          {tenantId ?? 'Unscoped session'}
+        </Typography>
+        <Typography variant="caption" color="text.secondary" sx={{ textTransform: 'capitalize' }}>
+          Role: {role ?? 'none'}
+        </Typography>
+      </Box>
       <Divider />
       <List sx={{ px: 1, pt: 1 }}>
-        {NAV_ITEMS.map((item) => {
+        {NAV_ITEMS.filter((item) => hasAnyRole(role, item.roles)).map((item) => {
           const selected = location.pathname === item.path;
           return (
             <ListItem key={item.path} disablePadding sx={{ mb: 0.5 }}>
@@ -90,7 +115,6 @@ function Sidebar() {
 
   return (
     <Box component="nav" sx={{ width: { md: DRAWER_WIDTH }, flexShrink: 0 }}>
-      {/* Mobile drawer */}
       <Drawer
         variant="temporary"
         open={sidebarOpen}
@@ -104,7 +128,6 @@ function Sidebar() {
         {drawerContent}
       </Drawer>
 
-      {/* Desktop drawer */}
       <Drawer
         variant="permanent"
         sx={{
