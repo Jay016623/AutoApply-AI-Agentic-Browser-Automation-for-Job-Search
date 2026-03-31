@@ -197,6 +197,7 @@ class ApplicationAttemptService:
         attempt = await self._get_attempt(attempt_id)
         attempt.status = "completed"
         attempt.completed_at = datetime.now(UTC)
+        attempt.next_retry_at = None
         await self._db.commit()
         await self._db.refresh(attempt)
         await self._audit(attempt, "application_attempt_completed", message="Execution completed")
@@ -210,6 +211,55 @@ class ApplicationAttemptService:
         await self._db.commit()
         await self._db.refresh(attempt)
         await self._audit(attempt, "application_attempt_abandoned", message=reason)
+        return attempt
+
+    async def schedule_retry(
+        self,
+        attempt_id: str,
+        *,
+        next_retry_at: datetime,
+        max_retries: int,
+    ) -> ApplicationAttempt:
+        attempt = await self._get_attempt(attempt_id)
+        if attempt.retry_count >= max_retries:
+            attempt.status = "waiting_manual"
+            attempt.manual_checkpoint_required = True
+            attempt.manual_checkpoint_reason = "retry_limit_exhausted"
+            attempt.next_retry_at = None
+            await self._db.commit()
+            await self._db.refresh(attempt)
+            await self._audit(
+                attempt,
+                "application_attempt_waiting_manual",
+                message="Retry limit exhausted; manual intervention required",
+            )
+            return attempt
+
+        attempt.retry_count = attempt.retry_count + 1
+        attempt.status = "retry_scheduled"
+        attempt.next_retry_at = next_retry_at
+        await self._db.commit()
+        await self._db.refresh(attempt)
+        await self._audit(
+            attempt,
+            "application_attempt_retry_scheduled",
+            message=f"Retry scheduled for {next_retry_at.isoformat()}",
+            metadata={"retry_count": attempt.retry_count},
+        )
+        return attempt
+
+    async def mark_retry_dispatched(self, attempt_id: str) -> ApplicationAttempt:
+        attempt = await self._get_attempt(attempt_id)
+        attempt.status = "running"
+        attempt.next_retry_at = None
+        await self._db.commit()
+        await self._db.refresh(attempt)
+        await self._audit(
+            attempt,
+            "application_attempt_started",
+            message="Retry dispatched to apply queue",
+            metadata={"retry_count": attempt.retry_count},
+        )
         return attempt
 
     async def create_proof_artifact(

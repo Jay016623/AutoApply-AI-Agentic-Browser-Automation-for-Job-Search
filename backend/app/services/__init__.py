@@ -7,6 +7,7 @@ Modules:
     analytics   -- Dashboard statistics and reporting
     queue       -- Redis-based task queue operations
     execution_query -- Execution visibility query surfaces
+    retry_scheduler -- Queue-backed retry scheduling
 """
 
 __all__ = [
@@ -14,6 +15,7 @@ __all__ = [
     "application",
     "job_search",
     "execution_query",
+    "retry_scheduler",
     "queue",
     "resume",
 ]
