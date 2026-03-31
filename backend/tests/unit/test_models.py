@@ -5,6 +5,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application import Application
+from app.models.application_attempt import ApplicationAttempt
+from app.models.application_attempt_step import ApplicationAttemptStep
 from app.models.candidate import Candidate
 from app.models.candidate_profile_snapshot import CandidateProfileSnapshot
 from app.models.cover_letter_version import CoverLetterVersion
@@ -12,6 +14,7 @@ from app.models.job import Job
 from app.models.llm_usage import LLMUsage
 from app.models.resume import Resume
 from app.models.resume_version import ResumeVersion
+from app.models.proof_artifact import ProofArtifact
 from app.models.user_settings import UserSettings
 from app.models.workflow_run import WorkflowRun
 from app.models.workflow_step import WorkflowStep
@@ -247,3 +250,65 @@ class TestWorkflowModels:
         fetched = result.scalar_one()
         assert fetched.current_state == "discovered"
         assert fetched.steps[0].to_state == "matched"
+
+
+class TestExecutionAttemptModels:
+    async def test_application_attempt_and_step_constraints(
+        self,
+        db_session: AsyncSession,
+        sample_job_data: dict,
+    ) -> None:
+        job = Job(**sample_job_data)
+        db_session.add(job)
+        await db_session.flush()
+        app = Application(job_id=job.id, status="queued", apply_mode="review")
+        db_session.add(app)
+        await db_session.flush()
+
+        attempt = ApplicationAttempt(
+            tenant_id="tenant-1",
+            application_id=app.id,
+            workflow_run_id=None,
+            status="running",
+            idempotency_key="attempt-key-1",
+            attempt_number=1,
+        )
+        db_session.add(attempt)
+        await db_session.flush()
+
+        step = ApplicationAttemptStep(
+            tenant_id="tenant-1",
+            attempt_id=attempt.id,
+            step_name="submit",
+            sequence_number=1,
+            status="completed",
+            idempotency_key="attempt-key-1:submit",
+        )
+        db_session.add(step)
+
+        artifact = ProofArtifact(
+            tenant_id="tenant-1",
+            application_id=app.id,
+            attempt_id=attempt.id,
+            attempt_step_id=step.id,
+            artifact_type="log",
+            storage_path="attempt://trace/1",
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        saved_attempt = (
+            await db_session.execute(select(ApplicationAttempt).where(ApplicationAttempt.id == attempt.id))
+        ).scalar_one()
+        assert saved_attempt.idempotency_key == "attempt-key-1"
+        assert saved_attempt.attempt_number == 1
+
+        saved_step = (
+            await db_session.execute(select(ApplicationAttemptStep).where(ApplicationAttemptStep.id == step.id))
+        ).scalar_one()
+        assert saved_step.sequence_number == 1
+
+        saved_artifact = (
+            await db_session.execute(select(ProofArtifact).where(ProofArtifact.id == artifact.id))
+        ).scalar_one()
+        assert saved_artifact.attempt_step_id == step.id

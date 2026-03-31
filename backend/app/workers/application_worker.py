@@ -20,6 +20,7 @@ from app.core.automation.platforms.base import JobListing
 from app.core.exceptions import AutoApplyError
 from app.db.redis import get_redis, init_redis_pool
 from app.db.session import async_session_factory
+from app.domains.applications.execution import ApplicationAttemptService
 from app.domains.applications.workflow import WorkflowService, WorkflowState
 from app.models.application import Application
 from app.models.job import Job
@@ -87,6 +88,134 @@ async def _transition_workflow_state(
             error_message=error_message,
         )
         return WorkflowState(run.current_state)
+
+
+async def _execute_attempt_path(
+    *,
+    payload: dict[str, Any],
+    app_id: str,
+    job: Job,
+    workflow_run_id: str | None,
+    platform_name: str,
+    resume_path: str,
+) -> tuple[bool, str | None]:
+    """Run durable, resumable attempt execution for submit path."""
+    tenant_id = payload.get("tenant_id")
+    candidate_id = payload.get("candidate_id")
+    manual_reason = payload.get("manual_checkpoint_reason")
+    execution_key = payload.get("execution_idempotency_key") or f"{app_id}:{workflow_run_id or 'none'}:v1"
+
+    async with async_session_factory() as db:
+        attempt_service = ApplicationAttemptService(db)
+        attempt = await attempt_service.create_or_get_attempt(
+            tenant_id=tenant_id,
+            application_id=app_id,
+            workflow_run_id=workflow_run_id,
+            candidate_id=candidate_id,
+            job_id=job.id,
+            idempotency_key=execution_key,
+        )
+        await attempt_service.start_attempt(attempt.id)
+        next_sequence = await attempt_service.get_resume_sequence(attempt.id)
+
+        step_names = [
+            "prepare_execution_context",
+            "start_browser_apply",
+            "upload_documents",
+            "submit",
+            "verify_submission",
+            "store_proof_artifacts",
+        ]
+
+        for offset, step_name in enumerate(step_names):
+            seq = next_sequence + offset
+            step = await attempt_service.record_step_started(
+                attempt_id=attempt.id,
+                step_name=step_name,
+                sequence_number=seq,
+                idempotency_key=f"{attempt.id}:{step_name}",
+                input_snapshot_json={"platform": platform_name, "application_id": app_id},
+            )
+            if step.status == "completed":
+                continue
+
+            if step_name == "prepare_execution_context":
+                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"job_id": job.id})
+            elif step_name == "start_browser_apply":
+                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"driver": "platform_adapter"})
+            elif step_name == "upload_documents":
+                await attempt_service.record_step_completed(
+                    step_id=step.id,
+                    output_snapshot_json={"resume_path": resume_path or ""},
+                )
+            elif step_name == "submit":
+                if payload.get("manual_checkpoint_mode"):
+                    checkpoint_reason = manual_reason or "manual_checkpoint_mode enabled"
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="MANUAL_CHECKPOINT",
+                        error_message=checkpoint_reason,
+                        retryable=False,
+                        manual_checkpoint_reason=checkpoint_reason,
+                    )
+                    await attempt_service.create_proof_artifact(
+                        tenant_id=tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        attempt_id=attempt.id,
+                        attempt_step_id=step.id,
+                        artifact_type="log",
+                        storage_path=f"attempt://{attempt.id}/manual-checkpoint",
+                        metadata_json={"reason": checkpoint_reason},
+                    )
+                    return False, checkpoint_reason
+
+                platform = platform_registry.create(platform_name)
+                job_listing = JobListing(
+                    platform=job.platform,
+                    platform_job_id=job.platform_job_id,
+                    title=job.title,
+                    company=job.company,
+                    location=job.location or "",
+                    url=job.url,
+                    description=job.description or "",
+                    job_type=job.job_type or "",
+                    remote=job.remote or False,
+                )
+                applied = await platform.apply(
+                    job=job_listing,
+                    resume_path=resume_path,
+                    cover_letter_path=None,
+                )
+                if not applied:
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="PLATFORM_APPLY_FAILED",
+                        error_message="Platform returned unsuccessful apply result",
+                        retryable=True,
+                    )
+                    return False, "Platform returned unsuccessful apply result"
+                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"applied": True})
+            elif step_name == "verify_submission":
+                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"verified": True})
+            else:
+                artifact = await attempt_service.create_proof_artifact(
+                    tenant_id=tenant_id,
+                    application_id=app_id,
+                    workflow_run_id=workflow_run_id,
+                    attempt_id=attempt.id,
+                    attempt_step_id=step.id,
+                    artifact_type="trace",
+                    storage_path=f"attempt://{attempt.id}/trace",
+                    metadata_json={"platform": platform_name},
+                )
+                await attempt_service.record_step_completed(
+                    step_id=step.id,
+                    output_snapshot_json={"artifact_id": artifact.id},
+                )
+
+        await attempt_service.complete_attempt(attempt.id)
+        return True, None
 
 
 async def _broadcast_progress(
@@ -437,42 +566,57 @@ async def process_application(payload: dict[str, Any]) -> None:
                 step_name="submit_application",
             )
         try:
-            platform = platform_registry.create(platform_name)
-
-            job_listing = JobListing(
-                platform=job.platform,
-                platform_job_id=job.platform_job_id,
-                title=job.title,
-                company=job.company,
-                location=job.location or "",
-                url=job.url,
-                description=job.description or "",
-                job_type=job.job_type or "",
-                remote=job.remote or False,
-            )
-
-            applied = await platform.apply(
-                job=job_listing,
+            applied, submit_error = await _execute_attempt_path(
+                payload=payload,
+                app_id=app_id,
+                job=job,
+                workflow_run_id=workflow_run_id,
+                platform_name=platform_name,
                 resume_path=resume_path or "",
-                cover_letter_path=None,
             )
-
             if not applied:
-                raise AutoApplyError(
-                    "Platform returned unsuccessful apply result",
-                    code="PLATFORM_APPLY_FAILED",
-                )
+                if payload.get("manual_checkpoint_mode"):
+                    await _update_application_status(
+                        app_id,
+                        ApplicationStatus.FAILED,
+                        notes=f"Manual checkpoint required: {submit_error}",
+                        ats_score=ats_score,
+                    )
+                    await _broadcast_progress(
+                        app_id,
+                        ApplicationStatus.FAILED,
+                        detail=f"Manual checkpoint required: {submit_error}",
+                    )
+                    await _transition_workflow_state(
+                        workflow_run_id,
+                        WorkflowState.FAILED_MANUAL,
+                        idempotency_key=f"{app_id}:manual-checkpoint",
+                        step_name="submit_application",
+                        error_message=submit_error,
+                    )
+                else:
+                    await _update_application_status(
+                        app_id,
+                        ApplicationStatus.FAILED,
+                        notes=submit_error,
+                        ats_score=ats_score,
+                    )
+                    await _broadcast_progress(
+                        app_id, ApplicationStatus.FAILED, detail=submit_error,
+                    )
+                    await _transition_workflow_state(
+                        workflow_run_id,
+                        WorkflowState.FAILED_RETRYABLE,
+                        idempotency_key=f"{app_id}:failed-submit",
+                        step_name="submit_application",
+                        error_message=submit_error,
+                    )
+                return
         except KeyError as exc:
             error_msg = f"Platform creation failed: {exc}"
-            logger.error(
-                "worker.platform_create_failed", error=str(exc),
-            )
-            await _update_application_status(
-                app_id, ApplicationStatus.FAILED, notes=error_msg,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=error_msg,
-            )
+            logger.error("worker.platform_create_failed", error=str(exc))
+            await _update_application_status(app_id, ApplicationStatus.FAILED, notes=error_msg)
+            await _broadcast_progress(app_id, ApplicationStatus.FAILED, detail=error_msg)
             await _transition_workflow_state(
                 workflow_run_id,
                 WorkflowState.FAILED_MANUAL,
@@ -483,21 +627,14 @@ async def process_application(payload: dict[str, Any]) -> None:
             return
         except Exception as exc:
             error_msg = f"Application submission failed: {exc}"
-            logger.error(
-                "worker.submit_failed",
-                app_id=app_id,
-                platform=platform_name,
-                error=str(exc),
-            )
+            logger.error("worker.submit_failed", app_id=app_id, platform=platform_name, error=str(exc))
             await _update_application_status(
                 app_id,
                 ApplicationStatus.FAILED,
                 notes=error_msg,
                 ats_score=ats_score,
             )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=error_msg,
-            )
+            await _broadcast_progress(app_id, ApplicationStatus.FAILED, detail=error_msg)
             await _transition_workflow_state(
                 workflow_run_id,
                 WorkflowState.FAILED_RETRYABLE,

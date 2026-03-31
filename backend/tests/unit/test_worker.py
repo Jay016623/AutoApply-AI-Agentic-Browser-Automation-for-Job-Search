@@ -101,6 +101,11 @@ class TestProcessApplicationHappyPath:
                 new_callable=AsyncMock,
                 side_effect=lambda *_args, **_kwargs: _args[1],
             ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
+            ),
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
@@ -161,6 +166,11 @@ class TestProcessApplicationHappyPath:
                 new_callable=AsyncMock,
                 side_effect=lambda *_args, **_kwargs: _args[1],
             ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
+            ),
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
@@ -206,6 +216,11 @@ class TestProcessApplicationErrors:
                 new_callable=AsyncMock,
                 side_effect=lambda *_args, **_kwargs: _args[1],
             ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
+            ),
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = False
@@ -241,6 +256,11 @@ class TestProcessApplicationErrors:
                 "app.workers.application_worker._transition_workflow_state",
                 new_callable=AsyncMock,
                 side_effect=lambda *_args, **_kwargs: _args[1],
+            ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
             ),
         ):
             mock_ws.broadcast = AsyncMock()
@@ -288,6 +308,11 @@ class TestProcessApplicationErrors:
                 "app.workers.application_worker._transition_workflow_state",
                 new_callable=AsyncMock,
                 side_effect=lambda *_args, **_kwargs: _args[1],
+            ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
             ),
         ):
             mock_ws.broadcast = AsyncMock()
@@ -339,6 +364,11 @@ class TestProcessApplicationErrors:
                 new_callable=AsyncMock,
                 side_effect=lambda *_args, **_kwargs: _args[1],
             ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
+            ),
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
@@ -386,6 +416,11 @@ class TestProcessApplicationErrors:
                 "app.workers.application_worker._transition_workflow_state",
                 new_callable=AsyncMock,
                 side_effect=lambda *_args, **_kwargs: _args[1],
+            ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
             ),
         ):
             mock_ws.broadcast = AsyncMock()
