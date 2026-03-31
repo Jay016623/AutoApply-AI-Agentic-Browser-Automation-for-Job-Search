@@ -20,6 +20,7 @@ from app.core.automation.platforms.base import JobListing
 from app.core.exceptions import AutoApplyError
 from app.db.redis import get_redis, init_redis_pool
 from app.db.session import async_session_factory
+from app.domains.applications.workflow import WorkflowService, WorkflowState
 from app.models.application import Application
 from app.models.job import Job
 from app.models.resume import Resume
@@ -28,6 +29,64 @@ from app.services import resume as resume_service
 from app.services.queue import dequeue
 
 logger = structlog.get_logger(__name__)
+
+_WORKFLOW_PROGRESS_ORDER: list[WorkflowState] = [
+    WorkflowState.DISCOVERED,
+    WorkflowState.MATCHED,
+    WorkflowState.SHORTLISTED,
+    WorkflowState.TAILORED,
+    WorkflowState.READY_TO_APPLY,
+    WorkflowState.APPLYING,
+    WorkflowState.SUBMITTED,
+]
+
+
+def _state_reached(current_state: WorkflowState, target_state: WorkflowState) -> bool:
+    """Return True when the workflow has already reached/passed target_state."""
+    if current_state in (WorkflowState.FAILED_MANUAL, WorkflowState.FAILED_RETRYABLE, WorkflowState.ABANDONED):
+        return False
+    return _WORKFLOW_PROGRESS_ORDER.index(current_state) >= _WORKFLOW_PROGRESS_ORDER.index(target_state)
+
+
+async def _ensure_workflow_run(application_id: str, job_id: str) -> tuple[str, WorkflowState]:
+    """Get or create workflow run for application and persist link if available."""
+    async with async_session_factory() as db:
+        workflow_service = WorkflowService(db)
+        result = await db.execute(select(Application).where(Application.id == application_id))
+        application = result.scalar_one_or_none()
+        if not isinstance(application, Application):
+            application = None
+
+        run_id: str | None = application.workflow_run_id if application is not None else None
+        if run_id:
+            run = await workflow_service.get_run(run_id)
+            return run.id, WorkflowState(run.current_state)
+
+        run = await workflow_service.create_run(candidate_id=application_id, job_id=job_id or None)
+        if application is not None:
+            application.workflow_run_id = run.id
+            await db.commit()
+        return run.id, WorkflowState(run.current_state)
+
+
+async def _transition_workflow_state(
+    workflow_run_id: str,
+    target_state: WorkflowState,
+    idempotency_key: str,
+    step_name: str,
+    error_message: str | None = None,
+) -> WorkflowState:
+    """Apply a durable workflow transition and return updated state."""
+    async with async_session_factory() as db:
+        workflow_service = WorkflowService(db)
+        run = await workflow_service.transition_state(
+            run_id=workflow_run_id,
+            target_state=target_state,
+            idempotency_key=idempotency_key,
+            step_name=step_name,
+            error_message=error_message,
+        )
+        return WorkflowState(run.current_state)
 
 
 async def _broadcast_progress(
@@ -203,6 +262,12 @@ async def process_application(payload: dict[str, Any]) -> None:
     try:
         settings = get_settings()
         min_score = settings.min_ats_score
+        workflow_run_id, workflow_state = await _ensure_workflow_run(app_id, job_id)
+
+        if workflow_state == WorkflowState.SUBMITTED:
+            await _update_application_status(app_id, ApplicationStatus.APPLIED)
+            await _broadcast_progress(app_id, ApplicationStatus.APPLIED, detail="Already submitted in previous workflow run")
+            return
 
         # --------------------------------------------------------------
         # Step 1: Load job details from DB
@@ -229,88 +294,134 @@ async def process_application(payload: dict[str, Any]) -> None:
             await _broadcast_progress(
                 app_id, ApplicationStatus.FAILED, detail=error_msg,
             )
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_MANUAL,
+                idempotency_key=f"{app_id}:failed-job-load",
+                step_name="load_job",
+                error_message=error_msg,
+            )
             return
+
+        if not _state_reached(workflow_state, WorkflowState.MATCHED):
+            workflow_state = await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.MATCHED,
+                idempotency_key=f"{app_id}:matched",
+                step_name="load_job",
+            )
+
+        if not _state_reached(workflow_state, WorkflowState.SHORTLISTED):
+            workflow_state = await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.SHORTLISTED,
+                idempotency_key=f"{app_id}:shortlisted",
+                step_name="shortlist",
+            )
 
         # --------------------------------------------------------------
         # Step 2: Generate tailored resume + cover letter
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "generating_resume")
         resume_path: str | None = None
-        try:
-            if resume_id:
-                async with async_session_factory() as db:
-                    gen_request = ResumeGenerateRequest(
-                        base_resume_id=resume_id,
-                        job_id=job_id,
-                        template_id="modern",
-                    )
-                    tailored_resp = (
-                        await resume_service.generate_tailored_resume(
-                            db, gen_request,
+        if not _state_reached(workflow_state, WorkflowState.TAILORED):
+            await _broadcast_progress(app_id, "generating_resume")
+            try:
+                if resume_id:
+                    async with async_session_factory() as db:
+                        gen_request = ResumeGenerateRequest(
+                            base_resume_id=resume_id,
+                            job_id=job_id,
+                            template_id="modern",
                         )
-                    )
-                    result = await db.execute(
-                        select(Resume).where(
-                            Resume.id == tailored_resp.id,
-                        ),
-                    )
-                    tailored_resume = result.scalar_one_or_none()
+                        tailored_resp = (
+                            await resume_service.generate_tailored_resume(
+                                db, gen_request,
+                            )
+                        )
+                        result = await db.execute(
+                            select(Resume).where(
+                                Resume.id == tailored_resp.id,
+                            ),
+                        )
+                        tailored_resume = result.scalar_one_or_none()
 
-                if tailored_resume:
-                    resume_path = (
-                        tailored_resume.file_path_pdf
-                        or tailored_resume.file_path_docx
-                    )
-                    logger.info(
-                        "worker.resume_generated",
-                        resume_id=tailored_resume.id,
-                    )
-            else:
-                logger.info("worker.no_base_resume", app_id=app_id)
-        except Exception as exc:
-            logger.warning(
-                "worker.resume_generation_failed",
-                app_id=app_id,
-                error=str(exc),
+                    if tailored_resume:
+                        resume_path = (
+                            tailored_resume.file_path_pdf
+                            or tailored_resume.file_path_docx
+                        )
+                        logger.info(
+                            "worker.resume_generated",
+                            resume_id=tailored_resume.id,
+                        )
+                else:
+                    logger.info("worker.no_base_resume", app_id=app_id)
+            except Exception as exc:
+                logger.warning(
+                    "worker.resume_generation_failed",
+                    app_id=app_id,
+                    error=str(exc),
+                )
+
+            workflow_state = await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.TAILORED,
+                idempotency_key=f"{app_id}:tailored",
+                step_name="tailor_resume",
             )
 
         # --------------------------------------------------------------
         # Step 3: Score with ATS
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "scoring_ats")
         ats_score: float | None = None
-        try:
-            ats_score = await _run_ats_scoring(job, resume_id)
-            logger.info(
-                "worker.ats_scored", app_id=app_id, score=ats_score,
-            )
-        except Exception as exc:
-            logger.warning(
-                "worker.ats_scoring_failed",
-                app_id=app_id,
-                error=str(exc),
-            )
+        if not _state_reached(workflow_state, WorkflowState.READY_TO_APPLY):
+            await _broadcast_progress(app_id, "scoring_ats")
+            try:
+                ats_score = await _run_ats_scoring(job, resume_id)
+                logger.info(
+                    "worker.ats_scored", app_id=app_id, score=ats_score,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "worker.ats_scoring_failed",
+                    app_id=app_id,
+                    error=str(exc),
+                )
 
-        if ats_score is not None and ats_score < min_score:
-            skip_msg = (
-                f"ATS score {ats_score:.2f} below minimum "
-                f"threshold {min_score:.2f}"
+            if ats_score is not None and ats_score < min_score:
+                skip_msg = (
+                    f"ATS score {ats_score:.2f} below minimum "
+                    f"threshold {min_score:.2f}"
+                )
+                logger.info(
+                    "worker.ats_below_threshold",
+                    app_id=app_id,
+                    score=ats_score,
+                )
+                await _update_application_status(
+                    app_id,
+                    ApplicationStatus.FAILED,
+                    notes=skip_msg,
+                    ats_score=ats_score,
+                )
+                await _broadcast_progress(
+                    app_id, ApplicationStatus.FAILED, detail=skip_msg,
+                )
+                await _transition_workflow_state(
+                    workflow_run_id,
+                    WorkflowState.FAILED_MANUAL,
+                    idempotency_key=f"{app_id}:failed-ats-threshold",
+                    step_name="score_ats",
+                    error_message=skip_msg,
+                )
+                return
+
+            workflow_state = await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.READY_TO_APPLY,
+                idempotency_key=f"{app_id}:ready-to-apply",
+                step_name="score_ats",
             )
-            logger.info(
-                "worker.ats_below_threshold",
-                app_id=app_id,
-                score=ats_score,
-            )
-            await _update_application_status(
-                app_id,
-                ApplicationStatus.FAILED,
-                notes=skip_msg,
-                ats_score=ats_score,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=skip_msg,
-            )
-            return
 
         logger.debug("worker.ats_threshold", min_score=min_score)
 
@@ -318,6 +429,13 @@ async def process_application(payload: dict[str, Any]) -> None:
         # Step 4: Apply via platform
         # --------------------------------------------------------------
         await _broadcast_progress(app_id, "submitting")
+        if not _state_reached(workflow_state, WorkflowState.APPLYING):
+            workflow_state = await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.APPLYING,
+                idempotency_key=f"{app_id}:applying",
+                step_name="submit_application",
+            )
         try:
             platform = platform_registry.create(platform_name)
 
@@ -355,6 +473,13 @@ async def process_application(payload: dict[str, Any]) -> None:
             await _broadcast_progress(
                 app_id, ApplicationStatus.FAILED, detail=error_msg,
             )
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_MANUAL,
+                idempotency_key=f"{app_id}:failed-platform-create",
+                step_name="submit_application",
+                error_message=error_msg,
+            )
             return
         except Exception as exc:
             error_msg = f"Application submission failed: {exc}"
@@ -373,6 +498,13 @@ async def process_application(payload: dict[str, Any]) -> None:
             await _broadcast_progress(
                 app_id, ApplicationStatus.FAILED, detail=error_msg,
             )
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_RETRYABLE,
+                idempotency_key=f"{app_id}:failed-submit",
+                step_name="submit_application",
+                error_message=error_msg,
+            )
             return
 
         # --------------------------------------------------------------
@@ -385,6 +517,12 @@ async def process_application(payload: dict[str, Any]) -> None:
             applied_at=datetime.now(UTC),
         )
         await _broadcast_progress(app_id, ApplicationStatus.APPLIED)
+        await _transition_workflow_state(
+            workflow_run_id,
+            WorkflowState.SUBMITTED,
+            idempotency_key=f"{app_id}:submitted",
+            step_name="submit_application",
+        )
         logger.info(
             "worker.completed",
             job_id=job_id,
@@ -407,6 +545,17 @@ async def process_application(payload: dict[str, Any]) -> None:
             ApplicationStatus.FAILED,
             detail=str(exc),
         )
+        try:
+            workflow_run_id, _ = await _ensure_workflow_run(app_id, job_id)
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_MANUAL,
+                idempotency_key=f"{app_id}:failed-auto-apply-error",
+                step_name="worker_error",
+                error_message=str(exc),
+            )
+        except Exception:
+            logger.warning("worker.workflow_failure_record_failed", app_id=app_id)
 
     except Exception as exc:
         logger.error(
@@ -425,6 +574,17 @@ async def process_application(payload: dict[str, Any]) -> None:
             ApplicationStatus.FAILED,
             detail="Unexpected error during application",
         )
+        try:
+            workflow_run_id, _ = await _ensure_workflow_run(app_id, job_id)
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_RETRYABLE,
+                idempotency_key=f"{app_id}:failed-unexpected-error",
+                step_name="worker_error",
+                error_message=str(exc),
+            )
+        except Exception:
+            logger.warning("worker.workflow_failure_record_failed", app_id=app_id)
 
 
 async def run_worker() -> None:

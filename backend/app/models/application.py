@@ -28,6 +28,11 @@ class Application(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("resumes.id", ondelete="SET NULL"),
         nullable=True,
     )
+    workflow_run_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     # Application state
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="queued")
