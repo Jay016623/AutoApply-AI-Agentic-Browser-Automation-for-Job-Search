@@ -66,6 +66,8 @@ async def list_artifacts(
     attempt_id: str,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=100),
+    artifact_type: str | None = Query(default=None),
+    attempt_step_id: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
     auth: AuthContext = Depends(get_auth_context),
 ) -> ProofArtifactListResponse:
@@ -75,6 +77,8 @@ async def list_artifacts(
         attempt_id,
         page=page,
         page_size=page_size,
+        artifact_type=artifact_type,
+        attempt_step_id=attempt_step_id,
     )
 
 

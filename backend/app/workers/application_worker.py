@@ -139,6 +139,23 @@ async def _execute_attempt_path(
         adapter_result: Any | None = None
         verification_result: Any | None = None
 
+        async def _write_step_log(step_id: str, step_name: str, payload: dict[str, Any]) -> None:
+            await attempt_service.store_structured_artifact(
+                tenant_id=tenant_id,
+                application_id=app_id,
+                workflow_run_id=workflow_run_id,
+                attempt_id=attempt.id,
+                attempt_step_id=step_id,
+                artifact_type="execution_log",
+                payload={
+                    "step_name": step_name,
+                    "attempt_id": attempt.id,
+                    "application_id": app_id,
+                    "payload": payload,
+                },
+                metadata_json={"category": "step_execution"},
+            )
+
         for offset, step_name in enumerate(step_names):
             seq = next_sequence + offset
             step = await attempt_service.record_step_started(
@@ -153,13 +170,16 @@ async def _execute_attempt_path(
 
             if step_name == "prepare_execution_context":
                 await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"job_id": job.id})
+                await _write_step_log(step.id, step_name, {"job_id": job.id})
             elif step_name == "start_browser_apply":
                 await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"driver": "platform_adapter"})
+                await _write_step_log(step.id, step_name, {"driver": "platform_adapter"})
             elif step_name == "upload_documents":
                 await attempt_service.record_step_completed(
                     step_id=step.id,
                     output_snapshot_json={"resume_path": resume_path or ""},
                 )
+                await _write_step_log(step.id, step_name, {"resume_path": resume_path or ""})
             elif step_name == "submit":
                 job_listing = JobListing(
                     platform=job.platform,
@@ -199,6 +219,14 @@ async def _execute_attempt_path(
                     )
                     return False, adapter_result.error_message or "Application execution failed"
                 await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"applied": True})
+                await _write_step_log(
+                    step.id,
+                    step_name,
+                    {
+                        "applied": True,
+                        "platform": platform_name,
+                    },
+                )
             elif step_name == "verify_submission":
                 if adapter_result is None:
                     await attempt_service.record_step_failed(
@@ -224,6 +252,15 @@ async def _execute_attempt_path(
                     )
                     return False, verification_result.reason or "Submission verification failed"
                 await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"verified": True})
+                await _write_step_log(
+                    step.id,
+                    step_name,
+                    {
+                        "verified": True,
+                        "classification": verification_result.classification,
+                        "evidence_keys": list((verification_result.evidence or {}).keys()),
+                    },
+                )
             else:
                 if adapter_result is None:
                     await attempt_service.record_step_failed(
@@ -237,15 +274,25 @@ async def _execute_attempt_path(
                 artifacts = adapter.collect_artifacts(adapter_result)
                 last_artifact = None
                 for artifact in artifacts:
-                    last_artifact = await attempt_service.create_proof_artifact(
+                    payload_metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {"value": str(artifact.metadata)}
+                    last_artifact = await attempt_service.store_structured_artifact(
                         tenant_id=tenant_id,
                         application_id=app_id,
                         workflow_run_id=workflow_run_id,
                         attempt_id=attempt.id,
                         attempt_step_id=step.id,
                         artifact_type=artifact.artifact_type,
-                        storage_path=artifact.storage_path.replace("attempt://adapter", f"attempt://{attempt.id}"),
-                        metadata_json=artifact.metadata,
+                        payload={
+                            "source_path": artifact.storage_path,
+                            "step_name": step_name,
+                            "verification_classification": verification_result.classification if verification_result else "failed",
+                            "metadata": payload_metadata,
+                        },
+                        metadata_json={
+                            "category": "adapter_artifact",
+                            "verification_linked": True,
+                            "source_path": artifact.storage_path,
+                        },
                     )
                 await attempt_service.record_step_completed(
                     step_id=step.id,

@@ -155,6 +155,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
         )
 
     def collect_artifacts(self, result: ExecutionResult) -> list[ArtifactRecord]:
+        verification_evidence = result.metadata.get("verification_evidence", {})
         artifacts = [
             ArtifactRecord(
                 artifact_type="trace",
@@ -167,9 +168,43 @@ class PlatformApplyAdapter(ExecutionAdapter):
             ArtifactRecord(
                 artifact_type="verification_evidence",
                 storage_path=f"attempt://adapter/{self.capability.adapter_name}/verification",
-                metadata=result.metadata.get("verification_evidence", {}),
+                metadata=verification_evidence,
+            ),
+            ArtifactRecord(
+                artifact_type="verification_bundle",
+                storage_path=f"attempt://adapter/{self.capability.adapter_name}/verification_bundle",
+                metadata={
+                    "platform": result.metadata.get("platform", "unknown"),
+                    "evidence_keys": sorted(list(verification_evidence.keys())),
+                    "submitted": result.submitted,
+                    "success": result.success,
+                },
             ),
         ]
+        if verification_evidence.get("screenshot_path"):
+            artifacts.append(
+                ArtifactRecord(
+                    artifact_type="screenshot",
+                    storage_path=f"attempt://adapter/{self.capability.adapter_name}/screenshot",
+                    metadata={"path": verification_evidence.get("screenshot_path")},
+                ),
+            )
+        if verification_evidence.get("dom_snapshot_path"):
+            artifacts.append(
+                ArtifactRecord(
+                    artifact_type="dom_snapshot",
+                    storage_path=f"attempt://adapter/{self.capability.adapter_name}/dom_snapshot",
+                    metadata={"path": verification_evidence.get("dom_snapshot_path")},
+                ),
+            )
+        if verification_evidence.get("execution_log"):
+            artifacts.append(
+                ArtifactRecord(
+                    artifact_type="execution_log",
+                    storage_path=f"attempt://adapter/{self.capability.adapter_name}/execution_log",
+                    metadata={"log": verification_evidence.get("execution_log")},
+                ),
+            )
         if result.error_code:
             artifacts.append(
                 ArtifactRecord(

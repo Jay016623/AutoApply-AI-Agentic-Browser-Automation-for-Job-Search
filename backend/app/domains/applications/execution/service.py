@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.application_attempt import ApplicationAttempt
 from app.models.application_attempt_step import ApplicationAttemptStep
 from app.models.proof_artifact import ProofArtifact
+from app.services.artifacts import ArtifactStorage, get_artifact_storage
 from app.services.audit import AuditLogCreate, record_audit_log
 
 ATTEMPT_TERMINAL_STATES = {"completed", "failed_manual", "abandoned"}
@@ -17,9 +18,15 @@ ATTEMPT_TERMINAL_STATES = {"completed", "failed_manual", "abandoned"}
 class ApplicationAttemptService:
     """Persistence-focused service for resumable apply execution."""
 
-    def __init__(self, db: AsyncSession, tenant_scope: str | None = None) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        tenant_scope: str | None = None,
+        artifact_storage: ArtifactStorage | None = None,
+    ) -> None:
         self._db = db
         self._tenant_scope = tenant_scope
+        self._artifact_storage = artifact_storage or get_artifact_storage()
 
     async def create_or_get_attempt(
         self,
@@ -289,7 +296,51 @@ class ApplicationAttemptService:
         self._db.add(artifact)
         await self._db.commit()
         await self._db.refresh(artifact)
+        attempt = await self._get_attempt(attempt_id) if attempt_id else None
+        if attempt is not None:
+            await self._audit(
+                attempt,
+                "proof_artifact_created",
+                message=f"Artifact stored: {artifact_type}",
+                metadata={"artifact_id": artifact.id, "artifact_type": artifact_type},
+            )
         return artifact
+
+    async def store_structured_artifact(
+        self,
+        *,
+        tenant_id: str | None,
+        application_id: str | None,
+        workflow_run_id: str | None,
+        attempt_id: str | None,
+        attempt_step_id: str | None,
+        artifact_type: str,
+        payload: dict[str, Any],
+        metadata_json: dict[str, Any] | None = None,
+    ) -> ProofArtifact:
+        stored = await self._artifact_storage.store_json(
+            tenant_id=tenant_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            payload=payload,
+        )
+        merged_metadata = {
+            **(metadata_json or {}),
+            "storage_backend": stored.backend,
+            "size_bytes": stored.size_bytes,
+        }
+        return await self.create_proof_artifact(
+            tenant_id=tenant_id,
+            application_id=application_id,
+            workflow_run_id=workflow_run_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            storage_path=stored.storage_path,
+            checksum=stored.checksum,
+            metadata_json=merged_metadata,
+        )
 
     async def get_resume_sequence(self, attempt_id: str) -> int:
         result = await self._db.execute(

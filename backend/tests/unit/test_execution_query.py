@@ -78,3 +78,29 @@ class TestExecutionQueryService:
 
         assert len(steps) == 1
         assert len(artifacts.items) == 1
+
+    async def test_artifacts_can_filter_by_type_and_step(self, db_session: AsyncSession) -> None:
+        attempt = await _seed_attempt(db_session, "tenant-1", "4")
+        auth = AuthContext(user_id="u1", tenant_id="tenant-1", role=Role.REVIEWER, enforced=True)
+        steps = await execution_query.list_attempt_steps(db_session, auth, attempt.id)
+        step_id = steps[0].id
+
+        extra = ProofArtifact(
+            tenant_id="tenant-1",
+            attempt_id=attempt.id,
+            attempt_step_id=step_id,
+            artifact_type="verification_evidence",
+            storage_path=f"attempt://{attempt.id}/verification",
+        )
+        db_session.add(extra)
+        await db_session.commit()
+
+        filtered = await execution_query.list_attempt_artifacts(
+            db_session,
+            auth,
+            attempt.id,
+            artifact_type="verification_evidence",
+            attempt_step_id=step_id,
+        )
+        assert len(filtered.items) == 1
+        assert filtered.items[0].artifact_type == "verification_evidence"

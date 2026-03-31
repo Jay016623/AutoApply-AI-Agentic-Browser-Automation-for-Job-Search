@@ -8,6 +8,7 @@ Modules:
     queue       -- Redis-based task queue operations
     execution_query -- Execution visibility query surfaces
     retry_scheduler -- Queue-backed retry scheduling
+    artifacts   -- Artifact storage abstraction and backends
 """
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "application",
     "job_search",
     "execution_query",
+    "artifacts",
     "retry_scheduler",
     "queue",
     "resume",

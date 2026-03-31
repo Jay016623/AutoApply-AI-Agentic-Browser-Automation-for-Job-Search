@@ -121,6 +121,10 @@ class Settings(BaseSettings):
     port: int = 8000
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
+    # Artifact storage
+    artifact_storage_provider: str = "local"
+    artifact_storage_local_root: str = "./data/artifacts"
+
     @field_validator("min_ats_score")
     @classmethod
     def validate_min_ats_score(cls, v: float) -> float:

@@ -113,6 +113,8 @@ async def list_attempt_artifacts(
     *,
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
+    artifact_type: str | None = None,
+    attempt_step_id: str | None = None,
 ) -> ProofArtifactListResponse:
     _ = await get_attempt(db, auth, attempt_id)
     page_size = min(page_size, MAX_PAGE_SIZE)
@@ -120,6 +122,12 @@ async def list_attempt_artifacts(
 
     query = select(ProofArtifact).where(ProofArtifact.attempt_id == attempt_id)
     count_query = select(func.count(ProofArtifact.id)).where(ProofArtifact.attempt_id == attempt_id)
+    if artifact_type:
+        query = query.where(ProofArtifact.artifact_type == artifact_type)
+        count_query = count_query.where(ProofArtifact.artifact_type == artifact_type)
+    if attempt_step_id:
+        query = query.where(ProofArtifact.attempt_step_id == attempt_step_id)
+        count_query = count_query.where(ProofArtifact.attempt_step_id == attempt_step_id)
     if auth.enforced:
         tenant_id = require_tenant(auth)
         query = query.where(ProofArtifact.tenant_id == tenant_id)
