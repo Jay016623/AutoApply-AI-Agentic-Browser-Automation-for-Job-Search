@@ -40,6 +40,13 @@ from app.schemas.resume import (
     ResumeUploadResponse,
 )
 from app.schemas.settings import LLMProviderStatus, SettingsResponse, SettingsUpdate
+from app.schemas.execution import (
+    ExecutionAttemptListResponse,
+    ExecutionAttemptResponse,
+    ExecutionStepResponse,
+    ProofArtifactListResponse,
+    ProofArtifactResponse,
+)
 
 __all__ = [
     "ATSScoreDistribution",
@@ -52,6 +59,11 @@ __all__ = [
     "ApplicationResponse",
     "ApplicationStatusUpdate",
     "DashboardStats",
+    "ProofArtifactResponse",
+    "ProofArtifactListResponse",
+    "ExecutionStepResponse",
+    "ExecutionAttemptResponse",
+    "ExecutionAttemptListResponse",
     # candidate
     "CandidateCreate",
     "CandidateListResponse",
