@@ -46,9 +46,12 @@ class WorkflowService:
         await self._db.refresh(run)
         return run
 
-    async def get_run(self, run_id: str) -> WorkflowRun:
+    async def get_run(self, run_id: str, tenant_id: str | None = None) -> WorkflowRun:
         """Load a workflow run or raise not found."""
-        result = await self._db.execute(select(WorkflowRun).where(WorkflowRun.id == run_id))
+        query = select(WorkflowRun).where(WorkflowRun.id == run_id)
+        if tenant_id:
+            query = query.where(WorkflowRun.tenant_id == tenant_id)
+        result = await self._db.execute(query)
         run = result.scalar_one_or_none()
         if run is None:
             raise RecordNotFoundError("WorkflowRun", run_id)
@@ -62,9 +65,10 @@ class WorkflowService:
         step_name: str,
         actor_id: str | None = None,
         error_message: str | None = None,
+        tenant_id: str | None = None,
     ) -> WorkflowRun:
         """Perform idempotent state transition and audit it."""
-        run = await self.get_run(run_id)
+        run = await self.get_run(run_id, tenant_id=tenant_id)
 
         existing = await self._find_step_by_idempotency(run_id, idempotency_key)
         if existing is not None:
@@ -127,9 +131,9 @@ class WorkflowService:
         )
         return run
 
-    async def evaluate_retry(self, run_id: str) -> RetryDecision:
+    async def evaluate_retry(self, run_id: str, tenant_id: str | None = None) -> RetryDecision:
         """Evaluate retry policy for a workflow run."""
-        run = await self.get_run(run_id)
+        run = await self.get_run(run_id, tenant_id=tenant_id)
         return evaluate_retry(
             state=WorkflowState(run.current_state),
             retry_count=run.retry_count,

@@ -87,6 +87,7 @@ async def upload_resume(
     db: AsyncSession,
     file: UploadFile,
     candidate_id: str | None = None,
+    auth: AuthContext | None = None,
 ) -> ResumeUploadResponse:
     """Upload, parse, and store a resume file.
 
@@ -138,6 +139,7 @@ async def upload_resume(
         skills_detected = _extract_skills(parsed_text)
 
     resume = Resume(
+        tenant_id=(require_tenant(auth) if auth and auth.enforced else (auth.tenant_id if auth else None)),
         name=file.filename or "Untitled Resume",
         type="base",
         candidate_id=candidate_id,
@@ -168,7 +170,7 @@ async def upload_resume(
     )
 
 
-async def list_resumes(db: AsyncSession) -> ResumeListResponse:
+async def list_resumes(db: AsyncSession, auth: AuthContext | None = None) -> ResumeListResponse:
     """List all resumes.
 
     Args:
@@ -177,18 +179,30 @@ async def list_resumes(db: AsyncSession) -> ResumeListResponse:
     Returns:
         List of all resumes with total count.
     """
-    result = await db.execute(select(Resume).order_by(Resume.created_at.desc()))
+    query = select(Resume)
+    if auth and auth.enforced:
+        query = query.where(Resume.tenant_id == require_tenant(auth))
+    elif auth and auth.tenant_id:
+        query = query.where(Resume.tenant_id == auth.tenant_id)
+    result = await db.execute(query.order_by(Resume.created_at.desc()))
     resumes = list(result.scalars().all())
     items = [ResumeResponse.model_validate(r) for r in resumes]
     return ResumeListResponse(items=items, total=len(items))
 
 
-async def get_resume(db: AsyncSession, resume_id: str) -> Resume:
+async def get_resume(db: AsyncSession, resume_id: str, auth: AuthContext | None = None) -> Resume:
     """Get a resume by ID or raise RecordNotFoundError."""
-    result = await db.execute(select(Resume).where(Resume.id == resume_id))
+    query = select(Resume).where(Resume.id == resume_id)
+    if auth and auth.enforced:
+        query = query.where(Resume.tenant_id == require_tenant(auth))
+    elif auth and auth.tenant_id:
+        query = query.where(Resume.tenant_id == auth.tenant_id)
+    result = await db.execute(query)
     resume = result.scalar_one_or_none()
     if resume is None:
         raise RecordNotFoundError("Resume", resume_id)
+    if auth:
+        ensure_tenant_access(auth, resume.tenant_id)
     return resume
 
 
@@ -332,6 +346,7 @@ def _parse_education_section(text: str) -> list[dict]:
 async def generate_tailored_resume(
     db: AsyncSession,
     request: ResumeGenerateRequest,
+    auth: AuthContext | None = None,
 ) -> ResumeResponse:
     """Generate a tailored resume for a specific job using LLM.
 
@@ -345,7 +360,7 @@ async def generate_tailored_resume(
     Returns:
         The generated tailored resume response.
     """
-    base = await get_resume(db, request.base_resume_id)
+    base = await get_resume(db, request.base_resume_id, auth=auth)
     job = await _get_job(db, request.job_id)
 
     # Build structured data from base resume text
@@ -368,6 +383,7 @@ async def generate_tailored_resume(
         template_id=request.template_id,
         base_resume_id=request.base_resume_id,
         job_id=request.job_id,
+        tenant_id=base.tenant_id,
         candidate_id=request.candidate_id or base.candidate_id,
         file_path_pdf=doc.pdf_path,
         file_path_docx=doc.docx_path,
@@ -437,6 +453,7 @@ async def score_resume(
     db: AsyncSession,
     resume_id: str,
     request: ResumeScoreRequest,
+    auth: AuthContext | None = None,
 ) -> ResumeScoreResponse:
     """Score a resume against a job listing using multi-factor ATS analysis.
 
@@ -452,7 +469,7 @@ async def score_resume(
     Returns:
         Detailed ATS score breakdown.
     """
-    resume = await get_resume(db, resume_id)
+    resume = await get_resume(db, resume_id, auth=auth)
     job = await _get_job(db, request.job_id)
 
     resume_text = resume.content_text or ""
@@ -598,6 +615,7 @@ async def optimize_resume(
     db: AsyncSession,
     resume_id: str,
     job_id: str | None = None,
+    auth: AuthContext | None = None,
 ) -> ResumeResponse:
     """Optimize a resume for ATS compatibility using LLM rewriting.
 
@@ -613,7 +631,7 @@ async def optimize_resume(
     Returns:
         The newly created optimized resume.
     """
-    resume = await get_resume(db, resume_id)
+    resume = await get_resume(db, resume_id, auth=auth)
     target_job_id = job_id or resume.job_id
     if not target_job_id:
         raise RecordNotFoundError("Job", "none (no job_id provided)")
@@ -624,7 +642,7 @@ async def optimize_resume(
 
     # Score the resume to get detailed breakdown
     score_result = await score_resume(
-        db, resume_id, ResumeScoreRequest(job_id=target_job_id),
+        db, resume_id, ResumeScoreRequest(job_id=target_job_id), auth=auth,
     )
 
     # Get optimizer suggestions
@@ -693,6 +711,7 @@ async def optimize_resume(
         template_id=resume.template_id,
         base_resume_id=resume_id,
         job_id=target_job_id,
+        tenant_id=resume.tenant_id,
         candidate_id=resume.candidate_id,
         file_path_pdf=doc.pdf_path,
         file_path_docx=doc.docx_path,
@@ -728,3 +747,4 @@ async def optimize_resume(
         label=optimized.name,
     )
     return ResumeResponse.model_validate(optimized)
+from app.core.auth import AuthContext, ensure_tenant_access, require_tenant

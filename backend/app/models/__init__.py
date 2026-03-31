@@ -14,6 +14,8 @@ from app.models.proof_artifact import ProofArtifact
 from app.models.resume import Resume
 from app.models.resume_version import ResumeVersion
 from app.models.tenant import Tenant
+from app.models.tenant_membership import TenantMembership
+from app.models.user import User
 from app.models.user_settings import UserSettings
 from app.models.workflow_run import WorkflowRun
 from app.models.workflow_step import WorkflowStep
@@ -33,8 +35,10 @@ __all__ = [
     "Resume",
     "ResumeVersion",
     "Tenant",
+    "TenantMembership",
     "TimestampMixin",
     "UUIDPrimaryKeyMixin",
+    "User",
     "UserSettings",
     "WorkflowRun",
     "WorkflowStep",

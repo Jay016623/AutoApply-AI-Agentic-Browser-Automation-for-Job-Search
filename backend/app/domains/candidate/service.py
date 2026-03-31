@@ -1,7 +1,9 @@
 """Candidate domain service layer."""
 
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import AuthContext, Role, ensure_role, ensure_tenant_access, require_tenant
 from app.domains.candidate.repository import CandidateRepository
 from app.models.candidate import Candidate
 from app.models.candidate_profile_snapshot import CandidateProfileSnapshot
@@ -24,14 +26,23 @@ class CandidateService:
     def __init__(self, db: AsyncSession) -> None:
         self._repo = CandidateRepository(db)
 
-    async def list_candidates(self, tenant_id: str | None = None) -> CandidateListResponse:
-        items, total = await self._repo.list_candidates(tenant_id=tenant_id)
+    async def list_candidates(self, auth: AuthContext, tenant_id: str | None = None) -> CandidateListResponse:
+        scoped_tenant = tenant_id or auth.tenant_id
+        if auth.enforced:
+            scoped_tenant = require_tenant(auth)
+        items, total = await self._repo.list_candidates(tenant_id=scoped_tenant)
         return CandidateListResponse(
             items=[CandidateResponse.model_validate(i) for i in items],
             total=total,
         )
 
-    async def create_candidate(self, data: CandidateCreate) -> CandidateResponse:
+    async def create_candidate(self, data: CandidateCreate, auth: AuthContext) -> CandidateResponse:
+        ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+        if auth.enforced:
+            tenant_id = require_tenant(auth)
+            if data.tenant_id and data.tenant_id != tenant_id:
+                raise HTTPException(status_code=403, detail="cross_tenant_candidate_create_denied")
+            data = data.model_copy(update={"tenant_id": tenant_id})
         candidate = Candidate(
             tenant_id=data.tenant_id,
             full_name=data.full_name,
@@ -45,27 +56,34 @@ class CandidateService:
         created = await self._repo.create_candidate(candidate)
         return CandidateResponse.model_validate(created)
 
-    async def get_candidate(self, candidate_id: str) -> CandidateResponse:
-        candidate = await self._repo.get_candidate(candidate_id)
+    async def get_candidate(self, candidate_id: str, auth: AuthContext) -> CandidateResponse:
+        candidate = await self._repo.get_candidate(candidate_id, tenant_id=auth.tenant_id if auth.enforced else None)
+        ensure_tenant_access(auth, candidate.tenant_id)
         return CandidateResponse.model_validate(candidate)
 
-    async def update_candidate(self, candidate_id: str, update: CandidateUpdate) -> CandidateResponse:
-        candidate = await self._repo.get_candidate(candidate_id)
+    async def update_candidate(self, candidate_id: str, update: CandidateUpdate, auth: AuthContext) -> CandidateResponse:
+        ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+        candidate = await self._repo.get_candidate(candidate_id, tenant_id=auth.tenant_id if auth.enforced else None)
+        ensure_tenant_access(auth, candidate.tenant_id)
         for key, value in update.model_dump(exclude_unset=True).items():
             setattr(candidate, key, value)
         updated = await self._repo.save(candidate)
         return CandidateResponse.model_validate(updated)
 
-    async def get_candidate_settings(self, candidate_id: str) -> CandidateSettingsSchema:
-        candidate = await self._repo.get_candidate(candidate_id)
+    async def get_candidate_settings(self, candidate_id: str, auth: AuthContext) -> CandidateSettingsSchema:
+        candidate = await self._repo.get_candidate(candidate_id, tenant_id=auth.tenant_id if auth.enforced else None)
+        ensure_tenant_access(auth, candidate.tenant_id)
         return CandidateSettingsSchema(**(candidate.settings or {}))
 
     async def update_candidate_settings(
         self,
         candidate_id: str,
         settings: CandidateSettingsSchema,
+        auth: AuthContext,
     ) -> CandidateSettingsSchema:
-        candidate = await self._repo.get_candidate(candidate_id)
+        ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+        candidate = await self._repo.get_candidate(candidate_id, tenant_id=auth.tenant_id if auth.enforced else None)
+        ensure_tenant_access(auth, candidate.tenant_id)
         candidate.settings = settings.model_dump()
         await self._repo.save(candidate)
         return CandidateSettingsSchema(**(candidate.settings or {}))
@@ -74,9 +92,12 @@ class CandidateService:
         self,
         candidate_id: str,
         payload: CandidateProfileSnapshotCreate,
+        auth: AuthContext,
     ) -> CandidateProfileSnapshotResponse:
-        candidate = await self._repo.get_candidate(candidate_id)
-        next_version = await self._repo.get_next_profile_version(candidate_id)
+        ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+        candidate = await self._repo.get_candidate(candidate_id, tenant_id=auth.tenant_id if auth.enforced else None)
+        ensure_tenant_access(auth, candidate.tenant_id)
+        next_version = await self._repo.get_next_profile_version(candidate_id, tenant_id=candidate.tenant_id)
         snapshot = CandidateProfileSnapshot(
             tenant_id=candidate.tenant_id,
             candidate_id=candidate.id,
@@ -92,14 +113,16 @@ class CandidateService:
         created = await self._repo.create_profile_snapshot(snapshot)
         return CandidateProfileSnapshotResponse.model_validate(created)
 
-    async def list_profile_snapshots(self, candidate_id: str) -> list[CandidateProfileSnapshotResponse]:
-        _ = await self._repo.get_candidate(candidate_id)
-        rows = await self._repo.list_profile_snapshots(candidate_id)
+    async def list_profile_snapshots(self, candidate_id: str, auth: AuthContext) -> list[CandidateProfileSnapshotResponse]:
+        candidate = await self._repo.get_candidate(candidate_id, tenant_id=auth.tenant_id if auth.enforced else None)
+        ensure_tenant_access(auth, candidate.tenant_id)
+        rows = await self._repo.list_profile_snapshots(candidate_id, tenant_id=candidate.tenant_id)
         return [CandidateProfileSnapshotResponse.model_validate(r) for r in rows]
 
-    async def list_resume_versions(self, candidate_id: str) -> list[ResumeVersionResponse]:
-        _ = await self._repo.get_candidate(candidate_id)
-        rows = await self._repo.list_resume_versions(candidate_id)
+    async def list_resume_versions(self, candidate_id: str, auth: AuthContext) -> list[ResumeVersionResponse]:
+        candidate = await self._repo.get_candidate(candidate_id, tenant_id=auth.tenant_id if auth.enforced else None)
+        ensure_tenant_access(auth, candidate.tenant_id)
+        rows = await self._repo.list_resume_versions(candidate_id, tenant_id=candidate.tenant_id)
         responses: list[ResumeVersionResponse] = []
         for r in rows:
             responses.append(
@@ -119,9 +142,10 @@ class CandidateService:
             )
         return responses
 
-    async def list_cover_letter_versions(self, candidate_id: str) -> list[CoverLetterVersionResponse]:
-        _ = await self._repo.get_candidate(candidate_id)
-        rows = await self._repo.list_cover_letter_versions(candidate_id)
+    async def list_cover_letter_versions(self, candidate_id: str, auth: AuthContext) -> list[CoverLetterVersionResponse]:
+        candidate = await self._repo.get_candidate(candidate_id, tenant_id=auth.tenant_id if auth.enforced else None)
+        ensure_tenant_access(auth, candidate.tenant_id)
+        rows = await self._repo.list_cover_letter_versions(candidate_id, tenant_id=candidate.tenant_id)
         responses: list[CoverLetterVersionResponse] = []
         for r in rows:
             responses.append(

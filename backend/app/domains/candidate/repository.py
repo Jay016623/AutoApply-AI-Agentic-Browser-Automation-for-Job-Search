@@ -34,10 +34,11 @@ class CandidateRepository:
         await self._db.refresh(candidate)
         return candidate
 
-    async def get_candidate(self, candidate_id: str) -> Candidate:
-        result = await self._db.execute(
-            select(Candidate).where(Candidate.id == candidate_id),
-        )
+    async def get_candidate(self, candidate_id: str, tenant_id: str | None = None) -> Candidate:
+        query = select(Candidate).where(Candidate.id == candidate_id)
+        if tenant_id:
+            query = query.where(Candidate.tenant_id == tenant_id)
+        result = await self._db.execute(query)
         candidate = result.scalar_one_or_none()
         if candidate is None:
             raise RecordNotFoundError("Candidate", candidate_id)
@@ -57,35 +58,35 @@ class CandidateRepository:
         await self._db.refresh(snapshot)
         return snapshot
 
-    async def get_next_profile_version(self, candidate_id: str) -> int:
+    async def get_next_profile_version(self, candidate_id: str, tenant_id: str | None = None) -> int:
+        query = select(func.max(CandidateProfileSnapshot.version)).where(
+            CandidateProfileSnapshot.candidate_id == candidate_id,
+        )
+        if tenant_id:
+            query = query.where(CandidateProfileSnapshot.tenant_id == tenant_id)
         result = await self._db.execute(
-            select(func.max(CandidateProfileSnapshot.version)).where(
-                CandidateProfileSnapshot.candidate_id == candidate_id,
-            ),
+            query,
         )
         max_version = result.scalar()
         return (int(max_version) + 1) if max_version is not None else 1
 
-    async def list_profile_snapshots(self, candidate_id: str) -> list[CandidateProfileSnapshot]:
-        result = await self._db.execute(
-            select(CandidateProfileSnapshot)
-            .where(CandidateProfileSnapshot.candidate_id == candidate_id)
-            .order_by(CandidateProfileSnapshot.version.desc()),
-        )
+    async def list_profile_snapshots(self, candidate_id: str, tenant_id: str | None = None) -> list[CandidateProfileSnapshot]:
+        query = select(CandidateProfileSnapshot).where(CandidateProfileSnapshot.candidate_id == candidate_id)
+        if tenant_id:
+            query = query.where(CandidateProfileSnapshot.tenant_id == tenant_id)
+        result = await self._db.execute(query.order_by(CandidateProfileSnapshot.version.desc()))
         return list(result.scalars().all())
 
-    async def list_resume_versions(self, candidate_id: str) -> list[ResumeVersion]:
-        result = await self._db.execute(
-            select(ResumeVersion)
-            .where(ResumeVersion.candidate_id == candidate_id)
-            .order_by(ResumeVersion.version.desc()),
-        )
+    async def list_resume_versions(self, candidate_id: str, tenant_id: str | None = None) -> list[ResumeVersion]:
+        query = select(ResumeVersion).where(ResumeVersion.candidate_id == candidate_id)
+        if tenant_id:
+            query = query.where(ResumeVersion.tenant_id == tenant_id)
+        result = await self._db.execute(query.order_by(ResumeVersion.version.desc()))
         return list(result.scalars().all())
 
-    async def list_cover_letter_versions(self, candidate_id: str) -> list[CoverLetterVersion]:
-        result = await self._db.execute(
-            select(CoverLetterVersion)
-            .where(CoverLetterVersion.candidate_id == candidate_id)
-            .order_by(CoverLetterVersion.version.desc()),
-        )
+    async def list_cover_letter_versions(self, candidate_id: str, tenant_id: str | None = None) -> list[CoverLetterVersion]:
+        query = select(CoverLetterVersion).where(CoverLetterVersion.candidate_id == candidate_id)
+        if tenant_id:
+            query = query.where(CoverLetterVersion.tenant_id == tenant_id)
+        result = await self._db.execute(query.order_by(CoverLetterVersion.version.desc()))
         return list(result.scalars().all())

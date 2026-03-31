@@ -63,7 +63,11 @@ async def _ensure_workflow_run(application_id: str, job_id: str) -> tuple[str, W
             run = await workflow_service.get_run(run_id)
             return run.id, WorkflowState(run.current_state)
 
-        run = await workflow_service.create_run(candidate_id=application_id, job_id=job_id or None)
+        run = await workflow_service.create_run(
+            candidate_id=application_id,
+            tenant_id=application.tenant_id if application is not None else None,
+            job_id=job_id or None,
+        )
         if application is not None:
             application.workflow_run_id = run.id
             await db.commit()
@@ -106,7 +110,7 @@ async def _execute_attempt_path(
     execution_key = payload.get("execution_idempotency_key") or f"{app_id}:{workflow_run_id or 'none'}:v1"
 
     async with async_session_factory() as db:
-        attempt_service = ApplicationAttemptService(db)
+        attempt_service = ApplicationAttemptService(db, tenant_scope=tenant_id)
         attempt = await attempt_service.create_or_get_attempt(
             tenant_id=tenant_id,
             application_id=app_id,

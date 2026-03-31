@@ -2,7 +2,8 @@
 
 from fastapi import APIRouter, Depends
 
-from app.api.deps import get_redis
+from app.api.deps import AuthContext, get_auth_context, get_redis
+from app.core.auth import Role, ensure_role
 from app.config.constants import QUEUE_APPLY, QUEUE_GENERATE, QUEUE_SCRAPE
 from app.config.settings import get_settings
 from app.db.redis import is_redis_available
@@ -13,8 +14,11 @@ router = APIRouter()
 
 
 @router.get("/health", response_model=SystemHealthResponse, summary="Operational health")
-async def system_health() -> SystemHealthResponse:
+async def system_health(
+    auth: AuthContext = Depends(get_auth_context),
+) -> SystemHealthResponse:
     """Return operational status used by admin tooling."""
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.OPERATOR, Role.READ_ONLY})
     settings = get_settings()
     redis_ok = await is_redis_available()
     return SystemHealthResponse(
@@ -28,8 +32,10 @@ async def system_health() -> SystemHealthResponse:
 @router.get("/queues", response_model=QueueDepthResponse, summary="Queue depths")
 async def queue_depths(
     redis=Depends(get_redis),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> QueueDepthResponse:
     """Return queue backlog depths for operational visibility."""
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.OPERATOR})
     if redis is None:
         return QueueDepthResponse(apply=0, scrape=0, generate=0)
 

@@ -15,6 +15,9 @@ from app.models.llm_usage import LLMUsage
 from app.models.resume import Resume
 from app.models.resume_version import ResumeVersion
 from app.models.proof_artifact import ProofArtifact
+from app.models.tenant import Tenant
+from app.models.tenant_membership import TenantMembership
+from app.models.user import User
 from app.models.user_settings import UserSettings
 from app.models.workflow_run import WorkflowRun
 from app.models.workflow_step import WorkflowStep
@@ -312,3 +315,23 @@ class TestExecutionAttemptModels:
             await db_session.execute(select(ProofArtifact).where(ProofArtifact.id == artifact.id))
         ).scalar_one()
         assert saved_artifact.attempt_step_id == step.id
+
+
+class TestAuthModels:
+    async def test_user_and_membership_persist(self, db_session: AsyncSession) -> None:
+        tenant = Tenant(name="Tenant A", slug="tenant-a")
+        db_session.add(tenant)
+        await db_session.flush()
+
+        user = User(email="owner@example.com", full_name="Owner")
+        db_session.add(user)
+        await db_session.flush()
+
+        membership = TenantMembership(tenant_id=tenant.id, user_id=user.id, role="owner")
+        db_session.add(membership)
+        await db_session.commit()
+
+        fetched = (
+            await db_session.execute(select(TenantMembership).where(TenantMembership.id == membership.id))
+        ).scalar_one()
+        assert fetched.role == "owner"

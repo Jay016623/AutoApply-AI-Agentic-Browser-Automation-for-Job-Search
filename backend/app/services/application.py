@@ -26,6 +26,7 @@ logger = structlog.get_logger(__name__)
 async def create_application(
     db: AsyncSession,
     data: ApplicationCreate,
+    auth: AuthContext,
 ) -> Application:
     """Create a single job application.
 
@@ -36,7 +37,10 @@ async def create_application(
     Returns:
         The newly created Application.
     """
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+    tenant_id = require_tenant(auth) if auth.enforced else (auth.tenant_id or data.tenant_id)
     application = Application(
+        tenant_id=tenant_id,
         job_id=data.job_id,
         resume_id=data.resume_id,
         apply_mode=data.apply_mode,
@@ -52,6 +56,7 @@ async def create_application(
 async def create_batch(
     db: AsyncSession,
     data: ApplicationBatchCreate,
+    auth: AuthContext,
 ) -> list[Application]:
     """Create multiple applications at once.
 
@@ -62,9 +67,12 @@ async def create_batch(
     Returns:
         List of newly created Applications.
     """
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+    tenant_id = require_tenant(auth) if auth.enforced else auth.tenant_id
     applications: list[Application] = []
     for job_id in data.job_ids:
         app = Application(
+            tenant_id=tenant_id,
             job_id=job_id,
             resume_id=data.resume_id,
             apply_mode=data.apply_mode,
@@ -83,6 +91,7 @@ async def create_batch(
 
 async def list_applications(
     db: AsyncSession,
+    auth: AuthContext,
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
     status: str | None = None,
@@ -103,6 +112,14 @@ async def list_applications(
 
     query = select(Application)
     count_query = select(func.count(Application.id))
+
+    if auth.enforced:
+        tenant_id = require_tenant(auth)
+        query = query.where(Application.tenant_id == tenant_id)
+        count_query = count_query.where(Application.tenant_id == tenant_id)
+    elif auth.tenant_id:
+        query = query.where(Application.tenant_id == auth.tenant_id)
+        count_query = count_query.where(Application.tenant_id == auth.tenant_id)
 
     if status:
         query = query.where(Application.status == status)
@@ -127,7 +144,7 @@ async def list_applications(
     )
 
 
-async def get_application(db: AsyncSession, app_id: str) -> Application:
+async def get_application(db: AsyncSession, app_id: str, auth: AuthContext) -> Application:
     """Get a single application by ID.
 
     Args:
@@ -146,10 +163,11 @@ async def get_application(db: AsyncSession, app_id: str) -> Application:
     app = result.scalar_one_or_none()
     if app is None:
         raise RecordNotFoundError("Application", app_id)
+    ensure_tenant_access(auth, app.tenant_id)
     return app
 
 
-async def approve_application(db: AsyncSession, app_id: str) -> Application:
+async def approve_application(db: AsyncSession, app_id: str, auth: AuthContext) -> Application:
     """Approve a pending application for submission.
 
     Args:
@@ -162,7 +180,8 @@ async def approve_application(db: AsyncSession, app_id: str) -> Application:
     Raises:
         RecordNotFoundError: If application does not exist.
     """
-    app = await get_application(db, app_id)
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+    app = await get_application(db, app_id, auth)
     if app.status not in (ApplicationStatus.PENDING_REVIEW, ApplicationStatus.QUEUED):
         raise ValueError(
             f"Cannot approve application in '{app.status}' state. "
@@ -179,6 +198,7 @@ async def update_status(
     db: AsyncSession,
     app_id: str,
     update: ApplicationStatusUpdate,
+    auth: AuthContext,
 ) -> Application:
     """Update an application's status and optional notes.
 
@@ -193,7 +213,8 @@ async def update_status(
     Raises:
         RecordNotFoundError: If application does not exist.
     """
-    app = await get_application(db, app_id)
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+    app = await get_application(db, app_id, auth)
     app.status = update.status
     if update.notes is not None:
         app.notes = update.notes
@@ -203,3 +224,4 @@ async def update_status(
     await db.refresh(app)
     logger.info("application_status_updated", app_id=app_id, status=update.status)
     return app
+from app.core.auth import AuthContext, Role, ensure_role, ensure_tenant_access, require_tenant

@@ -17,8 +17,9 @@ ATTEMPT_TERMINAL_STATES = {"completed", "failed_manual", "abandoned"}
 class ApplicationAttemptService:
     """Persistence-focused service for resumable apply execution."""
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncSession, tenant_scope: str | None = None) -> None:
         self._db = db
+        self._tenant_scope = tenant_scope
 
     async def create_or_get_attempt(
         self,
@@ -38,6 +39,8 @@ class ApplicationAttemptService:
         )
         existing = result.scalar_one_or_none()
         if existing is not None:
+            if self._tenant_scope and existing.tenant_id != self._tenant_scope:
+                raise PermissionError("cross_tenant_attempt_access_denied")
             return existing
 
         max_result = await self._db.execute(
@@ -248,11 +251,15 @@ class ApplicationAttemptService:
         return (result.scalar_one_or_none() or 0) + 1
 
     async def _get_attempt(self, attempt_id: str) -> ApplicationAttempt:
-        result = await self._db.execute(select(ApplicationAttempt).where(ApplicationAttempt.id == attempt_id))
+        query = select(ApplicationAttempt).where(ApplicationAttempt.id == attempt_id)
+        if self._tenant_scope:
+            query = query.where(ApplicationAttempt.tenant_id == self._tenant_scope)
+        result = await self._db.execute(query)
         return result.scalar_one()
 
     async def _get_step(self, step_id: str) -> ApplicationAttemptStep:
-        result = await self._db.execute(select(ApplicationAttemptStep).where(ApplicationAttemptStep.id == step_id))
+        query = select(ApplicationAttemptStep).where(ApplicationAttemptStep.id == step_id)
+        result = await self._db.execute(query)
         return result.scalar_one()
 
     async def _get_step_by_key(self, attempt_id: str, idempotency_key: str) -> ApplicationAttemptStep | None:
