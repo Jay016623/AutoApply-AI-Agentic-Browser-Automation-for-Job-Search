@@ -85,6 +85,17 @@ class FeatureFlagsSettings(BaseSettings):
     scheduler_enabled: bool = False
     watchdog_enabled: bool = True
     manual_checkpoint_mode: bool = True
+    allow_legacy_unscoped_writes: bool = False
+
+
+class AuthSettings(BaseSettings):
+    """Authentication and principal resolution configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="AUTH__")
+
+    token_secret: SecretStr = SecretStr("dev-insecure-change-me")
+    token_ttl_seconds: int = 3600
+    allow_legacy_header_auth: bool = True
 
 
 class Settings(BaseSettings):
@@ -112,6 +123,7 @@ class Settings(BaseSettings):
     llm: LLMSettings = LLMSettings()
     browser: BrowserSettings = BrowserSettings()
     feature_flags: FeatureFlagsSettings = FeatureFlagsSettings()
+    auth: AuthSettings = AuthSettings()
 
     # Job discovery
     exa_api_key: SecretStr = SecretStr("")
@@ -124,6 +136,9 @@ class Settings(BaseSettings):
     # Artifact storage
     artifact_storage_provider: str = "local"
     artifact_storage_local_root: str = "./data/artifacts"
+
+    # Startup behavior
+    auto_create_schema_on_startup: bool = False
 
     @field_validator("min_ats_score")
     @classmethod

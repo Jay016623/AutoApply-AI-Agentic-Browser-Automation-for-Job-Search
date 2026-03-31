@@ -16,7 +16,6 @@ from app.config.settings import Environment, get_settings
 from app.core.exceptions import AutoApplyError, RecordNotFoundError
 from app.db.redis import close_redis_pool, init_redis_pool
 from app.db.session import engine
-from app.models import Base
 from app.observability.logging import configure_logging
 
 logger = structlog.get_logger(__name__)
@@ -34,10 +33,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         environment=settings.environment.value,
     )
 
-    # Create database tables (safe no-op if they already exist)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("database_ready")
+    if settings.auto_create_schema_on_startup:
+        logger.warning("database_auto_create_enabled", warning="use_migrations_instead")
+    logger.info("database_ready", managed_by="alembic_migrations")
 
     await init_redis_pool(settings.redis_url)
 

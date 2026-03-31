@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type { ApiError } from '@/types/api';
+import { useAppStore } from '@/store/useAppStore';
 
 /** Pre-configured Axios instance pointing at the backend API. */
 const api = axios.create({
@@ -13,6 +14,24 @@ const api = axios.create({
 /** Attach a unique trace-id header to every outgoing request. */
 api.interceptors.request.use((config) => {
   config.headers['X-Trace-Id'] = crypto.randomUUID();
+  const session = useAppStore.getState();
+  if (session.accessToken) {
+    config.headers['Authorization'] = `Bearer ${session.accessToken}`;
+  }
+  if (session.authTenantId) {
+    config.headers['X-Tenant-Id'] = session.authTenantId;
+  }
+  if (session.authUserId) {
+    config.headers['X-User-Id'] = session.authUserId;
+  }
+  if (session.authRole) {
+    config.headers['X-Role'] = session.authRole;
+  }
+
+  // Dev bootstrap fallback for first token mint.
+  if (!session.accessToken && import.meta.env.VITE_BOOTSTRAP_USER_ID) {
+    config.headers['X-User-Id'] = import.meta.env.VITE_BOOTSTRAP_USER_ID;
+  }
   return config;
 });
 

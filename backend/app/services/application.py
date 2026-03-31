@@ -10,6 +10,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, ApplicationStatus
+from app.config.settings import get_settings
+from app.core.auth import AuthContext, Role, ensure_role, ensure_tenant_access, require_tenant
 from app.core.exceptions import RecordNotFoundError
 from app.models.application import Application
 from app.models.job import Job
@@ -40,6 +42,8 @@ async def create_application(
     """
     ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
     tenant_id = require_tenant(auth) if auth.enforced else (auth.tenant_id or data.tenant_id)
+    if tenant_id is None and not get_settings().feature_flags.allow_legacy_unscoped_writes:
+        raise ValueError("tenant_id_required_for_application_create")
     job_result = await db.execute(select(Job).where(Job.id == data.job_id))
     job = job_result.scalar_one_or_none()
     if job is None:
@@ -78,6 +82,8 @@ async def create_batch(
     """
     ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
     tenant_id = require_tenant(auth) if auth.enforced else auth.tenant_id
+    if tenant_id is None and not get_settings().feature_flags.allow_legacy_unscoped_writes:
+        raise ValueError("tenant_id_required_for_batch_create")
     applications: list[Application] = []
     for job_id in data.job_ids:
         job_result = await db.execute(select(Job).where(Job.id == job_id))
@@ -241,4 +247,3 @@ async def update_status(
     await db.refresh(app)
     logger.info("application_status_updated", app_id=app_id, status=update.status)
     return app
-from app.core.auth import AuthContext, Role, ensure_role, ensure_tenant_access, require_tenant

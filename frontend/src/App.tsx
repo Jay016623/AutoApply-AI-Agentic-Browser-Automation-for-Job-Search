@@ -11,10 +11,12 @@ import ResumesPage from '@/pages/ResumesPage';
 import SettingsPage from '@/pages/SettingsPage';
 import AnalyticsPage from '@/pages/AnalyticsPage';
 import { useAppStore } from '@/store/useAppStore';
+import { useSessionBootstrap } from '@/hooks/useSession';
 
 function App() {
   const notification = useAppStore((s) => s.notification);
   const clearNotification = useAppStore((s) => s.clearNotification);
+  useSessionBootstrap();
 
   return (
     <>

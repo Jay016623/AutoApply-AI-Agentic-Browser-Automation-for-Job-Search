@@ -1,13 +1,22 @@
 """Operational admin endpoints for Phase 1 foundations."""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import AuthContext, get_auth_context, get_redis
+from app.api.deps import AuthContext, get_auth_context, get_db, get_redis
 from app.core.auth import Role, ensure_role
+from app.core.principal import issue_principal_token
 from app.config.constants import QUEUE_APPLY, QUEUE_GENERATE, QUEUE_SCRAPE
 from app.config.settings import get_settings
 from app.db.redis import is_redis_available
-from app.schemas.admin import QueueDepthResponse, SystemHealthResponse
+from app.models.tenant_membership import TenantMembership
+from app.schemas.admin import (
+    QueueDepthResponse,
+    SessionBootstrapRequest,
+    SessionBootstrapResponse,
+    SystemHealthResponse,
+)
 from app.services.queue import get_queue_depth
 
 router = APIRouter()
@@ -47,4 +56,56 @@ async def queue_depths(
         apply=apply_depth,
         scrape=scrape_depth,
         generate=generate_depth,
+    )
+
+
+@router.post("/session/bootstrap", response_model=SessionBootstrapResponse, summary="Bootstrap session token")
+async def session_bootstrap(
+    payload: SessionBootstrapRequest,
+    db: AsyncSession = Depends(get_db),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> SessionBootstrapResponse:
+    """Mint a signed principal token from validated tenant membership.
+
+    This endpoint is an incremental bridge until external IdP auth is integrated.
+    It can be disabled by setting AUTH__ALLOW_LEGACY_HEADER_AUTH=false.
+    """
+    settings = get_settings()
+    if not settings.auth.allow_legacy_header_auth:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="session_bootstrap_disabled")
+    if not x_user_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="x_user_id_required_for_bootstrap")
+
+    try:
+        requested_role = Role(payload.role)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_role") from exc
+
+    membership = (
+        await db.execute(
+            select(TenantMembership).where(
+                TenantMembership.user_id == x_user_id,
+                TenantMembership.tenant_id == payload.tenant_id,
+            ),
+        )
+    ).scalar_one_or_none()
+    if membership is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="tenant_membership_required")
+    if membership.role != requested_role.value:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="role_mismatch_with_membership")
+
+    expires_in = settings.auth.token_ttl_seconds
+    token = issue_principal_token(
+        user_id=x_user_id,
+        tenant_id=payload.tenant_id,
+        role=requested_role,
+        secret=settings.auth.token_secret.get_secret_value(),
+        ttl_seconds=expires_in,
+    )
+    return SessionBootstrapResponse(
+        access_token=token,
+        expires_in=expires_in,
+        user_id=x_user_id,
+        tenant_id=payload.tenant_id,
+        role=requested_role.value,
     )

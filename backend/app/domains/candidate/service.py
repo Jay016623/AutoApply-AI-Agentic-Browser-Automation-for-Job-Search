@@ -4,6 +4,7 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthContext, Role, ensure_role, ensure_tenant_access, require_tenant
+from app.config.settings import get_settings
 from app.domains.candidate.repository import CandidateRepository
 from app.models.candidate import Candidate
 from app.models.candidate_profile_snapshot import CandidateProfileSnapshot
@@ -53,6 +54,8 @@ class CandidateService:
             is_default=data.is_default,
             settings=data.settings.model_dump(),
         )
+        if candidate.tenant_id is None and not get_settings().feature_flags.allow_legacy_unscoped_writes:
+            raise HTTPException(status_code=400, detail="tenant_id_required_for_candidate_create")
         created = await self._repo.create_candidate(candidate)
         return CandidateResponse.model_validate(created)
 

@@ -15,8 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.documents.generator import DocumentGenerator
 from app.core.documents.parser import DocumentParser, ParsedResume
+from app.core.auth import AuthContext, ensure_tenant_access, require_tenant
 from app.core.exceptions import ParseError, RecordNotFoundError
 from app.core.llm.client import LLMClient
+from app.config.settings import get_settings
 from app.models.job import Job
 from app.models.resume import Resume
 from app.models.resume_version import ResumeVersion
@@ -148,6 +150,8 @@ async def upload_resume(
         file_path_docx=str(dest) if file_ext == ".docx" else None,
         content_text=parsed_text[:5000],
     )
+    if resume.tenant_id is None and not get_settings().feature_flags.allow_legacy_unscoped_writes:
+        raise PermissionError("tenant_id_required_for_resume_upload")
     db.add(resume)
     await db.commit()
     await db.refresh(resume)
@@ -347,6 +351,8 @@ async def generate_tailored_resume(
     db: AsyncSession,
     request: ResumeGenerateRequest,
     auth: AuthContext | None = None,
+    allow_system: bool = False,
+    system_tenant_id: str | None = None,
 ) -> ResumeResponse:
     """Generate a tailored resume for a specific job using LLM.
 
@@ -360,8 +366,14 @@ async def generate_tailored_resume(
     Returns:
         The generated tailored resume response.
     """
+    if auth is None and not allow_system:
+        raise PermissionError("auth_context_required_for_resume_generation")
     base = await get_resume(db, request.base_resume_id, auth=auth)
     job = await _get_job(db, request.job_id)
+    if auth is not None:
+        ensure_tenant_access(auth, job.tenant_id)
+    elif system_tenant_id and job.tenant_id and system_tenant_id != job.tenant_id:
+        raise PermissionError("system_tenant_mismatch_for_job")
 
     # Build structured data from base resume text
     resume_data = _build_resume_data_from_text(base.content_text or "")
@@ -432,7 +444,7 @@ async def _create_resume_version(
     next_version = (latest.version + 1) if latest is not None else 1
 
     version = ResumeVersion(
-        tenant_id=None,
+        tenant_id=resume.tenant_id,
         candidate_id=candidate_id,
         resume_id=resume.id,
         job_id=resume.job_id,
@@ -631,12 +643,15 @@ async def optimize_resume(
     Returns:
         The newly created optimized resume.
     """
+    if auth is None:
+        raise PermissionError("auth_context_required_for_resume_optimization")
     resume = await get_resume(db, resume_id, auth=auth)
     target_job_id = job_id or resume.job_id
     if not target_job_id:
         raise RecordNotFoundError("Job", "none (no job_id provided)")
 
     job = await _get_job(db, target_job_id)
+    ensure_tenant_access(auth, job.tenant_id)
     resume_text = resume.content_text or ""
     job_description = job.description or ""
 
@@ -747,4 +762,3 @@ async def optimize_resume(
         label=optimized.name,
     )
     return ResumeResponse.model_validate(optimized)
-from app.core.auth import AuthContext, ensure_tenant_access, require_tenant

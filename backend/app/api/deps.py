@@ -9,7 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthContext, Role
-from app.config.settings import get_settings
+from app.core.principal import parse_principal_token
+from app.config.settings import Environment, get_settings
 from app.db.redis import get_redis as _get_redis
 from app.db.session import get_db as _get_db
 from app.models.tenant_membership import TenantMembership
@@ -58,13 +59,50 @@ async def get_tenant_context(
 
 async def get_auth_context(
     db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(default=None, alias="Authorization"),
     x_user_id: str | None = Header(default=None, alias="X-User-Id"),
     x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
     x_role: str | None = Header(default=None, alias="X-Role"),
 ) -> AuthContext:
-    """Resolve auth context with feature-flagged hard tenant enforcement."""
+    """Resolve auth context from signed principal token with controlled legacy fallback."""
     settings = get_settings()
-    enforced = settings.feature_flags.tenant_enforcement
+    enforced = settings.feature_flags.tenant_enforcement or settings.environment != Environment.DEVELOPMENT
+
+    principal_user_id: str | None = None
+    principal_tenant_id: str | None = None
+    principal_role: Role | None = None
+
+    if authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_authorization_header")
+        principal = parse_principal_token(token.strip(), settings.auth.token_secret.get_secret_value())
+        principal_user_id = principal.user_id
+        principal_tenant_id = principal.tenant_id
+        principal_role = principal.role
+
+    if principal_user_id and principal_tenant_id and principal_role:
+        if enforced:
+            result = await db.execute(
+                select(TenantMembership).where(
+                    TenantMembership.user_id == principal_user_id,
+                    TenantMembership.tenant_id == principal_tenant_id,
+                ),
+            )
+            membership = result.scalar_one_or_none()
+            if membership is None:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="tenant_membership_required")
+            if membership.role != principal_role.value:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="role_mismatch_with_membership")
+        return AuthContext(
+            user_id=principal_user_id,
+            tenant_id=principal_tenant_id,
+            role=principal_role,
+            enforced=enforced,
+        )
+
+    if not settings.auth.allow_legacy_header_auth:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authorization_token_required")
 
     role: Role | None = None
     if x_role:

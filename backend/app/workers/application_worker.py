@@ -587,7 +587,10 @@ async def process_application(payload: dict[str, Any]) -> None:
                         )
                         tailored_resp = (
                             await resume_service.generate_tailored_resume(
-                                db, gen_request,
+                                db,
+                                gen_request,
+                                allow_system=True,
+                                system_tenant_id=job.tenant_id,
                             )
                         )
                         result = await db.execute(

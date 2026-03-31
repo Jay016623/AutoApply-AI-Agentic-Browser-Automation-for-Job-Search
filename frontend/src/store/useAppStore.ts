@@ -13,18 +13,32 @@ interface AppStoreState {
   notification: Notification | null;
   /** Whether the backend WebSocket is connected. */
   wsConnected: boolean;
+  accessToken: string | null;
+  authTenantId: string | null;
+  authUserId: string | null;
+  authRole: string | null;
 
   toggleSidebar: () => void;
   setSidebarOpen: (open: boolean) => void;
   showNotification: (message: string, severity?: Notification['severity']) => void;
   clearNotification: () => void;
   setWsConnected: (connected: boolean) => void;
+  setSession: (session: {
+    accessToken: string;
+    tenantId: string;
+    userId: string;
+    role: string;
+  } | null) => void;
 }
 
 export const useAppStore = create<AppStoreState>((set) => ({
   sidebarOpen: false,
   notification: null,
   wsConnected: false,
+  accessToken: null,
+  authTenantId: null,
+  authUserId: null,
+  authRole: null,
 
   toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
   setSidebarOpen: (open) => set({ sidebarOpen: open }),
@@ -40,4 +54,20 @@ export const useAppStore = create<AppStoreState>((set) => ({
 
   clearNotification: () => set({ notification: null }),
   setWsConnected: (connected) => set({ wsConnected: connected }),
+  setSession: (session) =>
+    set(
+      session
+        ? {
+            accessToken: session.accessToken,
+            authTenantId: session.tenantId,
+            authUserId: session.userId,
+            authRole: session.role,
+          }
+        : {
+            accessToken: null,
+            authTenantId: null,
+            authUserId: null,
+            authRole: null,
+          },
+    ),
 }));
