@@ -19,6 +19,7 @@ from app.core.exceptions import ParseError, RecordNotFoundError
 from app.core.llm.client import LLMClient
 from app.models.job import Job
 from app.models.resume import Resume
+from app.models.resume_version import ResumeVersion
 from app.schemas.resume import (
     ResumeGenerateRequest,
     ResumeListResponse,
@@ -85,6 +86,7 @@ def _extract_skills(text: str) -> list[str]:
 async def upload_resume(
     db: AsyncSession,
     file: UploadFile,
+    candidate_id: str | None = None,
 ) -> ResumeUploadResponse:
     """Upload, parse, and store a resume file.
 
@@ -138,6 +140,7 @@ async def upload_resume(
     resume = Resume(
         name=file.filename or "Untitled Resume",
         type="base",
+        candidate_id=candidate_id,
         template_id="modern",
         file_path_pdf=str(dest) if file_ext == ".pdf" else None,
         file_path_docx=str(dest) if file_ext == ".docx" else None,
@@ -146,6 +149,13 @@ async def upload_resume(
     db.add(resume)
     await db.commit()
     await db.refresh(resume)
+    await _create_resume_version(
+        db=db,
+        resume=resume,
+        candidate_id=candidate_id,
+        variant_type="base",
+        label=resume.name,
+    )
 
     logger.info("resume_uploaded", resume_id=resume.id, filename=file.filename)
 
@@ -358,6 +368,7 @@ async def generate_tailored_resume(
         template_id=request.template_id,
         base_resume_id=request.base_resume_id,
         job_id=request.job_id,
+        candidate_id=request.candidate_id or base.candidate_id,
         file_path_pdf=doc.pdf_path,
         file_path_docx=doc.docx_path,
         content_text=base.content_text,
@@ -365,6 +376,13 @@ async def generate_tailored_resume(
     db.add(tailored)
     await db.commit()
     await db.refresh(tailored)
+    await _create_resume_version(
+        db=db,
+        resume=tailored,
+        candidate_id=tailored.candidate_id,
+        variant_type="tailored",
+        label=tailored.name,
+    )
 
     logger.info(
         "tailored_resume_generated",
@@ -375,6 +393,44 @@ async def generate_tailored_resume(
         has_docx=doc.docx_path is not None,
     )
     return ResumeResponse.model_validate(tailored)
+
+
+async def _create_resume_version(
+    db: AsyncSession,
+    resume: Resume,
+    candidate_id: str | None,
+    variant_type: str,
+    label: str,
+) -> None:
+    """Persist version metadata for candidate-linked resume artifacts."""
+    if not candidate_id:
+        return
+
+    result = await db.execute(
+        select(ResumeVersion)
+        .where(ResumeVersion.candidate_id == candidate_id)
+        .order_by(ResumeVersion.version.desc())
+        .limit(1),
+    )
+    latest = result.scalar_one_or_none()
+    next_version = (latest.version + 1) if latest is not None else 1
+
+    version = ResumeVersion(
+        tenant_id=None,
+        candidate_id=candidate_id,
+        resume_id=resume.id,
+        job_id=resume.job_id,
+        version=next_version,
+        label=label,
+        template_id=resume.template_id,
+        variant_type=variant_type,
+        file_path_pdf=resume.file_path_pdf,
+        file_path_docx=resume.file_path_docx,
+        content_text=resume.content_text,
+        ats_score=resume.ats_score,
+    )
+    db.add(version)
+    await db.commit()
 
 
 async def score_resume(
@@ -637,6 +693,7 @@ async def optimize_resume(
         template_id=resume.template_id,
         base_resume_id=resume_id,
         job_id=target_job_id,
+        candidate_id=resume.candidate_id,
         file_path_pdf=doc.pdf_path,
         file_path_docx=doc.docx_path,
         content_text=resume_text,
@@ -662,5 +719,12 @@ async def optimize_resume(
         optimized_id=optimized.id,
         original_score=score_result.overall_score,
         new_score=optimized.ats_score,
+    )
+    await _create_resume_version(
+        db=db,
+        resume=optimized,
+        candidate_id=optimized.candidate_id,
+        variant_type="optimized",
+        label=optimized.name,
     )
     return ResumeResponse.model_validate(optimized)

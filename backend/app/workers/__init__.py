@@ -1,5 +1,11 @@
-"""Background workers for async task processing."""
+"""Background workers package."""
 
-from app.workers.application_worker import process_application, run_worker
-
-__all__ = ["process_application", "run_worker"]
+__all__ = [
+    "application_worker",
+    "apply_worker",
+    "discovery_worker",
+    "matching_worker",
+    "scheduler_worker",
+    "tailoring_worker",
+    "watchdog_worker",
+]

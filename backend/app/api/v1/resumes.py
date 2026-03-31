@@ -40,6 +40,7 @@ ALLOWED_MIME_TYPES = {
 )
 async def upload_resume(
     file: UploadFile,
+    candidate_id: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> ResumeUploadResponse:
     """Upload a PDF or DOCX resume for parsing and storage."""
@@ -67,7 +68,7 @@ async def upload_resume(
             raise HTTPException(status_code=413, detail="File too large. Max 10MB.")
     await file.seek(0)
 
-    return await resume_service.upload_resume(db, file)
+    return await resume_service.upload_resume(db, file, candidate_id=candidate_id)
 
 
 @router.get(

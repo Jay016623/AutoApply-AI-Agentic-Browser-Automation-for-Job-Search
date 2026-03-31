@@ -20,6 +20,17 @@ from app.schemas.job import (
     JobListResponse,
     JobSearchRequest,
 )
+from app.schemas.candidate import (
+    CandidateCreate,
+    CandidateListResponse,
+    CandidateProfileSnapshotCreate,
+    CandidateProfileSnapshotResponse,
+    CandidateResponse,
+    CandidateSettingsSchema,
+    CandidateUpdate,
+    CoverLetterVersionResponse,
+    ResumeVersionResponse,
+)
 from app.schemas.resume import (
     ResumeGenerateRequest,
     ResumeListResponse,
@@ -41,6 +52,15 @@ __all__ = [
     "ApplicationResponse",
     "ApplicationStatusUpdate",
     "DashboardStats",
+    # candidate
+    "CandidateCreate",
+    "CandidateListResponse",
+    "CandidateProfileSnapshotCreate",
+    "CandidateProfileSnapshotResponse",
+    "CandidateResponse",
+    "CandidateSettingsSchema",
+    "CandidateUpdate",
+    "CoverLetterVersionResponse",
     # job
     "JobAnalysisResponse",
     "JobListResponse",
@@ -56,6 +76,7 @@ __all__ = [
     "ResumeScoreRequest",
     "ResumeScoreResponse",
     "ResumeUploadResponse",
+    "ResumeVersionResponse",
     "SettingsResponse",
     "SettingsUpdate",
     "TimelineEntry",
