@@ -31,6 +31,19 @@ class AdapterFailureClass(str, Enum):
     UNSUPPORTED = "unsupported"
 
 
+class FailureCategory(str, Enum):
+    """Failure taxonomy for browser execution and verification."""
+
+    TIMEOUT = "timeout"
+    AUTH_EXPIRED = "auth_expired"
+    CAPTCHA = "captcha"
+    SELECTOR_DRIFT = "selector_drift"
+    UPLOAD_FAILED = "upload_failed"
+    DUPLICATE_APPLICATION = "duplicate_application"
+    UNSUPPORTED_UI = "unsupported_ui"
+    UNKNOWN = "unknown"
+
+
 @dataclass(slots=True, frozen=True)
 class AdapterCapability:
     """Capability metadata for orchestration and observability."""
@@ -71,6 +84,7 @@ class ExecutionResult:
     submitted: bool
     needs_manual_checkpoint: bool = False
     unsupported: bool = False
+    failure_category: FailureCategory | None = None
     error_code: str | None = None
     error_message: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -85,6 +99,8 @@ class VerificationResult:
     reason: str | None = None
     retryable: bool = False
     requires_manual_checkpoint: bool = False
+    confidence_score: float = 0.0
+    failure_category: FailureCategory | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
 
 

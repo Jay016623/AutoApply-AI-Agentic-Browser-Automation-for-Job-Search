@@ -18,6 +18,7 @@ from app.domains.applications.execution.adapters.base import (
     ExecutionAdapter,
     ExecutionContext,
     ExecutionResult,
+    FailureCategory,
     VerificationResult,
 )
 
@@ -53,6 +54,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
                 success=False,
                 submitted=False,
                 needs_manual_checkpoint=True,
+                failure_category=FailureCategory.UNSUPPORTED_UI,
                 error_code="MANUAL_CHECKPOINT",
                 error_message=context.manual_checkpoint_reason
                 or "manual checkpoint mode enabled",
@@ -65,6 +67,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
                 submitted=False,
                 needs_manual_checkpoint=True,
                 unsupported=True,
+                failure_category=FailureCategory.UNSUPPORTED_UI,
                 error_code="UNSUPPORTED_PLATFORM",
                 error_message=f"Unsupported execution adapter platform: {context.platform_name}",
                 metadata={"platform": context.platform_name},
@@ -78,11 +81,16 @@ class PlatformApplyAdapter(ExecutionAdapter):
         )
         normalized = self._normalize_apply_output(apply_output, context)
         if not normalized["applied"]:
+            category = self._infer_failure_category(
+                str(normalized["metadata"].get("error_message", "")),
+                normalized["metadata"].get("verification_evidence", {}),
+            )
             return ExecutionResult(
                 success=False,
                 submitted=False,
-                error_code="PLATFORM_APPLY_FAILED",
-                error_message="Platform returned unsuccessful apply result",
+                failure_category=category,
+                error_code=f"PLATFORM_APPLY_FAILED_{category.value.upper()}",
+                error_message=str(normalized["metadata"].get("error_message") or "Platform returned unsuccessful apply result"),
                 metadata=normalized["metadata"],
             )
 
@@ -105,14 +113,26 @@ class PlatformApplyAdapter(ExecutionAdapter):
         current_url = str(evidence.get("current_url", "")).lower()
         dom_markers = [str(marker).lower() for marker in evidence.get("dom_markers", [])]
         submission_id = evidence.get("submission_id")
+        if evidence.get("duplicate_application") is True:
+            return VerificationResult(
+                verified=True,
+                classification="confirmed_success",
+                confidence_score=0.9,
+                failure_category=FailureCategory.DUPLICATE_APPLICATION,
+                evidence=evidence,
+            )
 
         failure_phrases = ("not submitted", "submission failed", "try again", "error submitting")
         if any(phrase in text_blob for phrase in failure_phrases):
+            category = self._infer_failure_category(text_blob, evidence)
             return VerificationResult(
                 verified=False,
                 classification="failed",
                 reason="Confirmation page contains explicit failure signal",
-                retryable=True,
+                retryable=category in {FailureCategory.TIMEOUT, FailureCategory.UPLOAD_FAILED, FailureCategory.SELECTOR_DRIFT},
+                requires_manual_checkpoint=category in {FailureCategory.AUTH_EXPIRED, FailureCategory.CAPTCHA, FailureCategory.UNSUPPORTED_UI},
+                confidence_score=0.85,
+                failure_category=category,
                 evidence=evidence,
             )
 
@@ -126,6 +146,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
             return VerificationResult(
                 verified=True,
                 classification="confirmed_success",
+                confidence_score=min(1.0, 0.55 + (0.15 * strong_signal_count)),
                 evidence={
                     **evidence,
                     "signal_counts": {
@@ -138,19 +159,30 @@ class PlatformApplyAdapter(ExecutionAdapter):
             )
 
         if result.success and result.submitted:
+            minimum_confidence = self._minimum_confidence(platform)
+            confidence = 0.35 + (0.1 * int(success_phrase_hits > 0)) + (0.1 * int(url_hit))
+            low_confidence_reason = (
+                f"Low confidence verification ({confidence:.2f}) below policy threshold ({minimum_confidence:.2f})"
+            )
             return VerificationResult(
                 verified=False,
                 classification="uncertain",
-                reason="Apply returned success but no strong confirmation evidence found",
+                reason=low_confidence_reason,
                 requires_manual_checkpoint=True,
+                confidence_score=confidence,
+                failure_category=FailureCategory.UNKNOWN,
                 evidence=evidence,
             )
 
+        category = self._infer_failure_category(result.error_message or "", evidence)
         return VerificationResult(
             verified=False,
             classification="failed",
             reason=result.error_message or "Execution did not submit application",
-            retryable=True,
+            retryable=category in {FailureCategory.TIMEOUT, FailureCategory.UPLOAD_FAILED, FailureCategory.SELECTOR_DRIFT},
+            requires_manual_checkpoint=category in {FailureCategory.AUTH_EXPIRED, FailureCategory.CAPTCHA, FailureCategory.UNSUPPORTED_UI},
+            confidence_score=0.8,
+            failure_category=category,
             evidence=evidence,
         )
 
@@ -163,6 +195,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
                 metadata={
                     "platform": result.metadata.get("platform", "unknown"),
                     "success": result.success,
+                    "failure_category": result.failure_category.value if result.failure_category else None,
                 },
             ),
             ArtifactRecord(
@@ -178,6 +211,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
                     "evidence_keys": sorted(list(verification_evidence.keys())),
                     "submitted": result.submitted,
                     "success": result.success,
+                    "failure_category": result.failure_category.value if result.failure_category else None,
                 },
             ),
         ]
@@ -218,6 +252,8 @@ class PlatformApplyAdapter(ExecutionAdapter):
     def classify_failure(self, result: ExecutionResult) -> AdapterFailureClass:
         if result.success:
             return AdapterFailureClass.NONE
+        if result.failure_category in {FailureCategory.AUTH_EXPIRED, FailureCategory.CAPTCHA, FailureCategory.UNSUPPORTED_UI}:
+            return AdapterFailureClass.MANUAL_CHECKPOINT
         if result.unsupported:
             return AdapterFailureClass.UNSUPPORTED
         if result.needs_manual_checkpoint or result.error_code == "MANUAL_CHECKPOINT":
@@ -227,6 +263,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
     def _normalize_apply_output(self, apply_output: object, context: ExecutionContext) -> dict[str, object]:
         evidence: dict[str, object] = {}
         applied = False
+        error_message: str | None = None
 
         if isinstance(apply_output, bool):
             applied = apply_output
@@ -239,7 +276,13 @@ class PlatformApplyAdapter(ExecutionAdapter):
                 "text_markers": apply_output.get("text_markers", []),
                 "submission_id": apply_output.get("submission_id"),
                 "dom_snapshot_path": apply_output.get("dom_snapshot_path"),
+                "screenshot_path": apply_output.get("screenshot_path"),
+                "execution_log": apply_output.get("execution_log"),
+                "duplicate_application": apply_output.get("duplicate_application", False),
             }
+            error_message = apply_output.get("error_message")
+        else:
+            error_message = None
 
         if context.verification_hints:
             evidence = {**evidence, **context.verification_hints}
@@ -247,8 +290,35 @@ class PlatformApplyAdapter(ExecutionAdapter):
         metadata = {
             "platform": context.platform_name,
             "verification_evidence": evidence,
+            "error_message": error_message if not applied else None,
         }
         return {"applied": applied, "metadata": metadata}
+
+    def _minimum_confidence(self, platform: str) -> float:
+        policy = {
+            "linkedin": 0.75,
+            "indeed": 0.70,
+            "glassdoor": 0.70,
+        }
+        return policy.get(platform, 0.75)
+
+    def _infer_failure_category(self, message: str, evidence: dict[str, object]) -> FailureCategory:
+        text = f"{message} {' '.join([str(v) for v in evidence.values()])}".lower()
+        if any(term in text for term in ("timeout", "timed out", "took too long")):
+            return FailureCategory.TIMEOUT
+        if any(term in text for term in ("login expired", "session expired", "reauth", "not logged in")):
+            return FailureCategory.AUTH_EXPIRED
+        if "captcha" in text:
+            return FailureCategory.CAPTCHA
+        if any(term in text for term in ("selector", "element not found", "ui changed", "dom changed")):
+            return FailureCategory.SELECTOR_DRIFT
+        if any(term in text for term in ("upload failed", "resume upload", "file upload")):
+            return FailureCategory.UPLOAD_FAILED
+        if any(term in text for term in ("already applied", "duplicate application")):
+            return FailureCategory.DUPLICATE_APPLICATION
+        if any(term in text for term in ("unsupported ui", "unsupported flow", "modal not supported")):
+            return FailureCategory.UNSUPPORTED_UI
+        return FailureCategory.UNKNOWN
 
     def _success_phrases(self, platform: str) -> tuple[str, ...]:
         common = (

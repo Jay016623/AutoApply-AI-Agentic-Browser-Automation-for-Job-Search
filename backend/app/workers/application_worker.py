@@ -108,7 +108,7 @@ async def _execute_attempt_path(
     workflow_run_id: str | None,
     platform_name: str,
     resume_path: str,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, bool, str | None]:
     """Run durable, resumable attempt execution for submit path."""
     tenant_id = payload.get("tenant_id") or job.tenant_id
     candidate_id = payload.get("candidate_id")
@@ -218,7 +218,12 @@ async def _execute_attempt_path(
                         retryable=retryable,
                         manual_checkpoint_reason=manual_reason,
                     )
-                    return False, adapter_result.error_message or "Application execution failed"
+                    return (
+                        False,
+                        adapter_result.error_message or "Application execution failed",
+                        retryable,
+                        adapter_result.failure_category.value if adapter_result.failure_category else None,
+                    )
                 await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"applied": True})
                 await _write_step_log(
                     step.id,
@@ -237,7 +242,7 @@ async def _execute_attempt_path(
                         retryable=False,
                         manual_checkpoint_reason="Adapter execution contract violated",
                     )
-                    return False, "Adapter result missing before verification"
+                    return False, "Adapter result missing before verification", False, "unsupported_ui"
                 verification_result = adapter.verify(adapter_result)
                 if not verification_result.verified:
                     await attempt_service.record_step_failed(
@@ -251,7 +256,12 @@ async def _execute_attempt_path(
                             else None
                         ),
                     )
-                    return False, verification_result.reason or "Submission verification failed"
+                    return (
+                        False,
+                        verification_result.reason or "Submission verification failed",
+                        verification_result.retryable,
+                        verification_result.failure_category.value if verification_result.failure_category else "unknown",
+                    )
                 await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"verified": True})
                 await _write_step_log(
                     step.id,
@@ -271,7 +281,7 @@ async def _execute_attempt_path(
                         retryable=False,
                         manual_checkpoint_reason="artifacts_result_missing",
                     )
-                    return False, "Cannot collect artifacts without adapter result"
+                    return False, "Cannot collect artifacts without adapter result", False, "unsupported_ui"
                 artifacts = adapter.collect_artifacts(adapter_result)
                 last_artifact = None
                 for artifact in artifacts:
@@ -308,7 +318,7 @@ async def _execute_attempt_path(
                 )
 
         await attempt_service.complete_attempt(attempt.id)
-        return True, None
+        return True, None, False, None
 
 
 async def _broadcast_progress(
@@ -693,7 +703,7 @@ async def process_application(payload: dict[str, Any]) -> None:
                 step_name="submit_application",
             )
         try:
-            applied, submit_error = await _execute_attempt_path(
+            applied, submit_error, submit_retryable, submit_failure_category = await _execute_attempt_path(
                 payload=payload,
                 app_id=app_id,
                 job=job,
@@ -702,22 +712,22 @@ async def process_application(payload: dict[str, Any]) -> None:
                 resume_path=resume_path or "",
             )
             if not applied:
-                if payload.get("manual_checkpoint_mode"):
+                if payload.get("manual_checkpoint_mode") or not submit_retryable:
                     await _update_application_status(
                         app_id,
                         ApplicationStatus.FAILED,
-                        notes=f"Manual checkpoint required: {submit_error}",
+                        notes=f"Manual checkpoint required: {submit_error} (category={submit_failure_category or 'unknown'})",
                         ats_score=ats_score,
                     )
                     await _broadcast_progress(
                         app_id,
                         ApplicationStatus.FAILED,
-                        detail=f"Manual checkpoint required: {submit_error}",
+                        detail=f"Manual checkpoint required: {submit_error} (category={submit_failure_category or 'unknown'})",
                     )
                     await _transition_workflow_state(
                         workflow_run_id,
                         WorkflowState.FAILED_MANUAL,
-                        idempotency_key=f"{app_id}:manual-checkpoint",
+                        idempotency_key=f"{app_id}:manual-checkpoint:{submit_failure_category or 'unknown'}",
                         step_name="submit_application",
                         error_message=submit_error,
                     )
@@ -725,16 +735,16 @@ async def process_application(payload: dict[str, Any]) -> None:
                     await _update_application_status(
                         app_id,
                         ApplicationStatus.FAILED,
-                        notes=submit_error,
+                        notes=f"{submit_error} (category={submit_failure_category or 'unknown'})",
                         ats_score=ats_score,
                     )
                     await _broadcast_progress(
-                        app_id, ApplicationStatus.FAILED, detail=submit_error,
+                        app_id, ApplicationStatus.FAILED, detail=f"{submit_error} (category={submit_failure_category or 'unknown'})",
                     )
                     await _transition_workflow_state(
                         workflow_run_id,
                         WorkflowState.FAILED_RETRYABLE,
-                        idempotency_key=f"{app_id}:failed-submit",
+                        idempotency_key=f"{app_id}:failed-submit:{submit_failure_category or 'unknown'}",
                         step_name="submit_application",
                         error_message=submit_error,
                     )

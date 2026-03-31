@@ -6,6 +6,7 @@ from app.core.automation.platforms.base import JobListing
 from app.domains.applications.execution.adapters import (
     AdapterFailureClass,
     ExecutionContext,
+    FailureCategory,
     PlatformApplyAdapter,
 )
 
@@ -65,7 +66,8 @@ class TestPlatformApplyAdapter:
             result = await adapter.execute(_context())
 
         assert result.success is False
-        assert result.error_code == "PLATFORM_APPLY_FAILED"
+        assert result.error_code.startswith("PLATFORM_APPLY_FAILED_")
+        assert result.failure_category == FailureCategory.UNKNOWN
         assert adapter.classify_failure(result) == AdapterFailureClass.RETRYABLE
 
     async def test_success_with_strong_evidence_is_confirmed(self):
@@ -109,6 +111,7 @@ class TestPlatformApplyAdapter:
         assert verification.verified is False
         assert verification.classification == "uncertain"
         assert verification.requires_manual_checkpoint is True
+        assert verification.confidence_score < 0.75
 
     async def test_failure_markers_are_retryable_failed(self):
         adapter = PlatformApplyAdapter()
@@ -131,3 +134,21 @@ class TestPlatformApplyAdapter:
         assert verification.verified is False
         assert verification.classification == "failed"
         assert verification.retryable is True
+
+    async def test_captcha_failure_routes_to_manual(self):
+        adapter = PlatformApplyAdapter()
+        mock_platform = AsyncMock()
+        mock_platform.apply = AsyncMock(
+            return_value={
+                "submitted": False,
+                "error_message": "Captcha required before submission",
+            },
+        )
+
+        with patch("app.domains.applications.execution.adapters.platform_apply.platform_registry") as mock_registry:
+            mock_registry.has.return_value = True
+            mock_registry.create.return_value = mock_platform
+            result = await adapter.execute(_context(platform="linkedin"))
+
+        assert result.failure_category == FailureCategory.CAPTCHA
+        assert adapter.classify_failure(result) == AdapterFailureClass.MANUAL_CHECKPOINT
