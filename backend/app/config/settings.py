@@ -74,6 +74,19 @@ class BrowserSettings(BaseSettings):
         return max(1, min(5, v))
 
 
+class FeatureFlagsSettings(BaseSettings):
+    """Runtime feature flags for incremental rollouts."""
+
+    model_config = SettingsConfigDict(env_prefix="FEATURE__")
+
+    tenant_enforcement: bool = False
+    workflow_v2_enabled: bool = False
+    audit_log_enabled: bool = True
+    scheduler_enabled: bool = False
+    watchdog_enabled: bool = True
+    manual_checkpoint_mode: bool = True
+
+
 class Settings(BaseSettings):
     """Root application settings."""
 
@@ -98,6 +111,7 @@ class Settings(BaseSettings):
     # Nested settings
     llm: LLMSettings = LLMSettings()
     browser: BrowserSettings = BrowserSettings()
+    feature_flags: FeatureFlagsSettings = FeatureFlagsSettings()
 
     # Job discovery
     exa_api_key: SecretStr = SecretStr("")
