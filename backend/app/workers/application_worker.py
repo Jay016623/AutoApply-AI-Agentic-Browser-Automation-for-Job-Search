@@ -20,7 +20,12 @@ from app.core.automation.platforms.base import JobListing
 from app.core.exceptions import AutoApplyError
 from app.db.redis import get_redis, init_redis_pool
 from app.db.session import async_session_factory
-from app.domains.applications.execution import ApplicationAttemptService
+from app.domains.applications.execution import (
+    AdapterFailureClass,
+    ApplicationAttemptService,
+    ExecutionContext,
+    PlatformApplyAdapter,
+)
 from app.domains.applications.workflow import WorkflowService, WorkflowState
 from app.models.application import Application
 from app.models.job import Job
@@ -130,6 +135,9 @@ async def _execute_attempt_path(
             "verify_submission",
             "store_proof_artifacts",
         ]
+        adapter = PlatformApplyAdapter()
+        adapter_result: Any | None = None
+        verification_result: Any | None = None
 
         for offset, step_name in enumerate(step_names):
             seq = next_sequence + offset
@@ -153,28 +161,6 @@ async def _execute_attempt_path(
                     output_snapshot_json={"resume_path": resume_path or ""},
                 )
             elif step_name == "submit":
-                if payload.get("manual_checkpoint_mode"):
-                    checkpoint_reason = manual_reason or "manual_checkpoint_mode enabled"
-                    await attempt_service.record_step_failed(
-                        step_id=step.id,
-                        error_code="MANUAL_CHECKPOINT",
-                        error_message=checkpoint_reason,
-                        retryable=False,
-                        manual_checkpoint_reason=checkpoint_reason,
-                    )
-                    await attempt_service.create_proof_artifact(
-                        tenant_id=tenant_id,
-                        application_id=app_id,
-                        workflow_run_id=workflow_run_id,
-                        attempt_id=attempt.id,
-                        attempt_step_id=step.id,
-                        artifact_type="log",
-                        storage_path=f"attempt://{attempt.id}/manual-checkpoint",
-                        metadata_json={"reason": checkpoint_reason},
-                    )
-                    return False, checkpoint_reason
-
-                platform = platform_registry.create(platform_name)
                 job_listing = JobListing(
                     platform=job.platform,
                     platform_job_id=job.platform_job_id,
@@ -186,36 +172,83 @@ async def _execute_attempt_path(
                     job_type=job.job_type or "",
                     remote=job.remote or False,
                 )
-                applied = await platform.apply(
-                    job=job_listing,
-                    resume_path=resume_path,
-                    cover_letter_path=None,
-                )
-                if not applied:
-                    await attempt_service.record_step_failed(
-                        step_id=step.id,
-                        error_code="PLATFORM_APPLY_FAILED",
-                        error_message="Platform returned unsuccessful apply result",
-                        retryable=True,
-                    )
-                    return False, "Platform returned unsuccessful apply result"
-                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"applied": True})
-            elif step_name == "verify_submission":
-                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"verified": True})
-            else:
-                artifact = await attempt_service.create_proof_artifact(
+                exec_context = ExecutionContext(
                     tenant_id=tenant_id,
                     application_id=app_id,
                     workflow_run_id=workflow_run_id,
                     attempt_id=attempt.id,
-                    attempt_step_id=step.id,
-                    artifact_type="trace",
-                    storage_path=f"attempt://{attempt.id}/trace",
-                    metadata_json={"platform": platform_name},
+                    platform_name=platform_name,
+                    job_listing=job_listing,
+                    resume_path=resume_path,
+                    manual_checkpoint_mode=bool(payload.get("manual_checkpoint_mode")),
+                    manual_checkpoint_reason=manual_reason,
                 )
+                prepared_context = await adapter.prepare(exec_context)
+                adapter_result = await adapter.execute(prepared_context)
+                failure_class = adapter.classify_failure(adapter_result)
+                if failure_class != AdapterFailureClass.NONE:
+                    retryable = failure_class == AdapterFailureClass.RETRYABLE
+                    manual_reason = adapter_result.error_message if not retryable else None
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code=adapter_result.error_code or "APPLY_ADAPTER_FAILED",
+                        error_message=adapter_result.error_message or "Application execution failed",
+                        retryable=retryable,
+                        manual_checkpoint_reason=manual_reason,
+                    )
+                    return False, adapter_result.error_message or "Application execution failed"
+                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"applied": True})
+            elif step_name == "verify_submission":
+                if adapter_result is None:
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="ADAPTER_RESULT_MISSING",
+                        error_message="Adapter result missing before verification",
+                        retryable=False,
+                        manual_checkpoint_reason="Adapter execution contract violated",
+                    )
+                    return False, "Adapter result missing before verification"
+                verification_result = adapter.verify(adapter_result)
+                if not verification_result.verified:
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="SUBMISSION_NOT_VERIFIED",
+                        error_message=verification_result.reason or "Submission verification failed",
+                        retryable=False,
+                        manual_checkpoint_reason=verification_result.reason or "verification_failed",
+                    )
+                    return False, verification_result.reason or "Submission verification failed"
+                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"verified": True})
+            else:
+                if adapter_result is None:
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="ARTIFACTS_WITHOUT_RESULT",
+                        error_message="Cannot collect artifacts without adapter result",
+                        retryable=False,
+                        manual_checkpoint_reason="artifacts_result_missing",
+                    )
+                    return False, "Cannot collect artifacts without adapter result"
+                artifacts = adapter.collect_artifacts(adapter_result)
+                last_artifact = None
+                for artifact in artifacts:
+                    last_artifact = await attempt_service.create_proof_artifact(
+                        tenant_id=tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        attempt_id=attempt.id,
+                        attempt_step_id=step.id,
+                        artifact_type=artifact.artifact_type,
+                        storage_path=artifact.storage_path.replace("attempt://adapter", f"attempt://{attempt.id}"),
+                        metadata_json=artifact.metadata,
+                    )
                 await attempt_service.record_step_completed(
                     step_id=step.id,
-                    output_snapshot_json={"artifact_id": artifact.id},
+                    output_snapshot_json={
+                        "artifact_count": len(artifacts),
+                        "artifact_id": last_artifact.id if last_artifact else None,
+                        "verification": verification_result.verified if verification_result else False,
+                    },
                 )
 
         await attempt_service.complete_attempt(attempt.id)
@@ -380,16 +413,28 @@ async def process_application(payload: dict[str, Any]) -> None:
     # Validate platform is registered
     if not platform_registry.has(platform_name):
         logger.error("worker.unknown_platform", platform=platform_name)
+        unsupported_msg = f"Unsupported platform for automated apply: {platform_name}"
         await _update_application_status(
             app_id,
             ApplicationStatus.FAILED,
-            notes=f"Unknown platform: {platform_name}",
+            notes=unsupported_msg,
         )
         await _broadcast_progress(
             app_id,
             ApplicationStatus.FAILED,
-            detail=f"Unknown platform: {platform_name}",
+            detail=unsupported_msg,
         )
+        try:
+            workflow_run_id, _ = await _ensure_workflow_run(app_id, job_id)
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_MANUAL,
+                idempotency_key=f"{app_id}:failed-unsupported-platform",
+                step_name="submit_application",
+                error_message=unsupported_msg,
+            )
+        except Exception:
+            logger.warning("worker.workflow_failure_record_failed", app_id=app_id)
         return
 
     try:
