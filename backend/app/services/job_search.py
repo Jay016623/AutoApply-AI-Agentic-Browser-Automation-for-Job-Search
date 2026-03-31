@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.config.settings import get_settings
+from app.core.auth import AuthContext, ensure_tenant_access, require_tenant
 from app.core.automation.platforms import platform_registry
 from app.core.automation.platforms.base import JobListing
 from app.core.exceptions import RecordNotFoundError
@@ -31,6 +32,7 @@ logger = structlog.get_logger(__name__)
 async def search_jobs(
     db: AsyncSession,
     request: JobSearchRequest,
+    auth: AuthContext,
 ) -> JobListResponse:
     """Search for jobs across configured platforms.
 
@@ -66,6 +68,10 @@ async def search_jobs(
             has_next=False,
         )
 
+    tenant_id = require_tenant(auth) if auth.enforced else auth.tenant_id
+    if auth.enforced and tenant_id is None:
+        raise ValueError("tenant_required_for_job_search")
+
     all_jobs: list[Job] = []
 
     for platform_name in platforms_to_search:
@@ -98,10 +104,11 @@ async def search_jobs(
 
         for listing in listings:
             try:
-                job = _listing_to_job(listing)
+                job = _listing_to_job(listing, tenant_id=tenant_id)
                 # Check for duplicates before inserting
                 existing = await db.execute(
                     select(Job).where(
+                        Job.tenant_id == tenant_id,
                         Job.platform == job.platform,
                         Job.platform_job_id == job.platform_job_id,
                     ),
@@ -137,9 +144,10 @@ async def search_jobs(
             )
             for listing in exa_listings:
                 try:
-                    job = _listing_to_job(listing)
+                    job = _listing_to_job(listing, tenant_id=tenant_id)
                     existing = await db.execute(
                         select(Job).where(
+                            Job.tenant_id == tenant_id,
                             Job.platform == job.platform,
                             Job.platform_job_id == job.platform_job_id,
                         ),
@@ -176,7 +184,7 @@ async def search_jobs(
     )
 
 
-def _listing_to_job(listing: JobListing) -> Job:
+def _listing_to_job(listing: JobListing, tenant_id: str | None) -> Job:
     """Convert a platform ``JobListing`` to a ``Job`` database model.
 
     Args:
@@ -204,6 +212,7 @@ def _listing_to_job(listing: JobListing) -> Job:
         }
 
     return Job(
+        tenant_id=tenant_id,
         platform=listing.platform,
         platform_job_id=listing.platform_job_id,
         title=listing.title,
@@ -221,6 +230,7 @@ def _listing_to_job(listing: JobListing) -> Job:
 
 async def list_jobs(
     db: AsyncSession,
+    auth: AuthContext,
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
     status: str | None = None,
@@ -241,6 +251,14 @@ async def list_jobs(
 
     query = select(Job)
     count_query = select(func.count(Job.id))
+
+    if auth.enforced:
+        tenant_id = require_tenant(auth)
+        query = query.where(Job.tenant_id == tenant_id)
+        count_query = count_query.where(Job.tenant_id == tenant_id)
+    elif auth.tenant_id:
+        query = query.where(Job.tenant_id == auth.tenant_id)
+        count_query = count_query.where(Job.tenant_id == auth.tenant_id)
 
     if status:
         query = query.where(Job.status == status)
@@ -265,7 +283,7 @@ async def list_jobs(
     )
 
 
-async def get_job(db: AsyncSession, job_id: str) -> Job:
+async def get_job(db: AsyncSession, job_id: str, auth: AuthContext) -> Job:
     """Get a single job by ID.
 
     Args:
@@ -278,14 +296,20 @@ async def get_job(db: AsyncSession, job_id: str) -> Job:
     Raises:
         RecordNotFoundError: If job does not exist.
     """
-    result = await db.execute(select(Job).where(Job.id == job_id))
+    query = select(Job).where(Job.id == job_id)
+    if auth.enforced:
+        query = query.where(Job.tenant_id == require_tenant(auth))
+    elif auth.tenant_id:
+        query = query.where(Job.tenant_id == auth.tenant_id)
+    result = await db.execute(query)
     job = result.scalar_one_or_none()
     if job is None:
         raise RecordNotFoundError("Job", job_id)
+    ensure_tenant_access(auth, job.tenant_id)
     return job
 
 
-async def delete_job(db: AsyncSession, job_id: str) -> None:
+async def delete_job(db: AsyncSession, job_id: str, auth: AuthContext) -> None:
     """Delete a job by ID.
 
     Args:
@@ -295,7 +319,7 @@ async def delete_job(db: AsyncSession, job_id: str) -> None:
     Raises:
         RecordNotFoundError: If job does not exist.
     """
-    job = await get_job(db, job_id)
+    job = await get_job(db, job_id, auth)
     await db.delete(job)
     await db.commit()
     logger.info("job_deleted", job_id=job_id)
@@ -304,6 +328,7 @@ async def delete_job(db: AsyncSession, job_id: str) -> None:
 async def analyze_job(
     db: AsyncSession,
     job_id: str,
+    auth: AuthContext,
     resume_id: str | None = None,
 ) -> JobAnalysisResponse:
     """Analyze job-candidate match using ATS scoring.
@@ -323,7 +348,7 @@ async def analyze_job(
     Raises:
         RecordNotFoundError: If job does not exist.
     """
-    job = await get_job(db, job_id)
+    job = await get_job(db, job_id, auth)
     logger.info("job_analysis_requested", job_id=job_id, title=job.title)
 
     # If no resume provided, return placeholder scores
@@ -430,3 +455,6 @@ async def analyze_job(
                 "python -m spacy download en_core_web_sm",
             ],
         )
+    tenant_id = require_tenant(auth) if auth.enforced else auth.tenant_id
+    if auth.enforced and not tenant_id:
+        raise ValueError("tenant_required_for_job_search")

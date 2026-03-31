@@ -104,7 +104,7 @@ async def _execute_attempt_path(
     resume_path: str,
 ) -> tuple[bool, str | None]:
     """Run durable, resumable attempt execution for submit path."""
-    tenant_id = payload.get("tenant_id")
+    tenant_id = payload.get("tenant_id") or job.tenant_id
     candidate_id = payload.get("candidate_id")
     manual_reason = payload.get("manual_checkpoint_reason")
     execution_key = payload.get("execution_idempotency_key") or f"{app_id}:{workflow_run_id or 'none'}:v1"
@@ -431,6 +431,25 @@ async def process_application(payload: dict[str, Any]) -> None:
                 workflow_run_id,
                 WorkflowState.FAILED_MANUAL,
                 idempotency_key=f"{app_id}:failed-job-load",
+                step_name="load_job",
+                error_message=error_msg,
+            )
+            return
+
+        app_tenant_id: str | None = None
+        async with async_session_factory() as db:
+            app_result = await db.execute(select(Application).where(Application.id == app_id))
+            application_row = app_result.scalar_one_or_none()
+            if application_row is not None:
+                app_tenant_id = application_row.tenant_id
+        if app_tenant_id and job.tenant_id and app_tenant_id != job.tenant_id:
+            error_msg = "Application/job tenant mismatch"
+            await _update_application_status(app_id, ApplicationStatus.FAILED, notes=error_msg)
+            await _broadcast_progress(app_id, ApplicationStatus.FAILED, detail=error_msg)
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_MANUAL,
+                idempotency_key=f"{app_id}:failed-tenant-mismatch",
                 step_name="load_job",
                 error_message=error_msg,
             )

@@ -4,7 +4,7 @@ import structlog
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db
+from app.api.deps import AuthContext, get_auth_context, get_db
 from app.config.constants import DEFAULT_PAGE_SIZE
 from app.schemas.job import (
     JobAnalysisResponse,
@@ -26,13 +26,14 @@ router = APIRouter()
 async def search_jobs(
     request: JobSearchRequest,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> JobListResponse:
     """Launch a multi-platform job search.
 
     Platform scrapers are integrated in Phase 4.
     Currently returns empty results.
     """
-    return await job_service.search_jobs(db, request)
+    return await job_service.search_jobs(db, request, auth)
 
 
 @router.get(
@@ -45,9 +46,10 @@ async def list_jobs(
     page_size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=100),
     status: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> JobListResponse:
     """List stored job listings with optional status filter."""
-    return await job_service.list_jobs(db, page, page_size, status)
+    return await job_service.list_jobs(db, auth, page, page_size, status)
 
 
 @router.get(
@@ -58,9 +60,10 @@ async def list_jobs(
 async def get_job(
     job_id: str,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> JobListingResponse:
     """Get a single job listing by ID. Returns 404 if not found."""
-    job = await job_service.get_job(db, job_id)
+    job = await job_service.get_job(db, job_id, auth)
     return JobListingResponse.model_validate(job)
 
 
@@ -73,9 +76,10 @@ async def analyze_job(
     job_id: str,
     resume_id: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> JobAnalysisResponse:
     """Analyze how well the candidate matches a job listing."""
-    return await job_service.analyze_job(db, job_id, resume_id=resume_id)
+    return await job_service.analyze_job(db, job_id, auth, resume_id=resume_id)
 
 
 @router.delete(
@@ -86,6 +90,7 @@ async def analyze_job(
 async def delete_job(
     job_id: str,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> None:
     """Delete a job listing and its associated applications."""
-    await job_service.delete_job(db, job_id)
+    await job_service.delete_job(db, job_id, auth)

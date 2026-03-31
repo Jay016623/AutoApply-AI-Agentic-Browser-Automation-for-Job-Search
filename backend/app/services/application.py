@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, ApplicationStatus
 from app.core.exceptions import RecordNotFoundError
 from app.models.application import Application
+from app.models.job import Job
 from app.schemas.application import (
     ApplicationBatchCreate,
     ApplicationCreate,
@@ -39,6 +40,14 @@ async def create_application(
     """
     ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
     tenant_id = require_tenant(auth) if auth.enforced else (auth.tenant_id or data.tenant_id)
+    job_result = await db.execute(select(Job).where(Job.id == data.job_id))
+    job = job_result.scalar_one_or_none()
+    if job is None:
+        raise RecordNotFoundError("Job", data.job_id)
+    if tenant_id and job.tenant_id and job.tenant_id != tenant_id:
+        raise ValueError("application_job_tenant_mismatch")
+    if auth.enforced and job.tenant_id != tenant_id:
+        raise ValueError("application_job_tenant_mismatch")
     application = Application(
         tenant_id=tenant_id,
         job_id=data.job_id,
@@ -71,6 +80,14 @@ async def create_batch(
     tenant_id = require_tenant(auth) if auth.enforced else auth.tenant_id
     applications: list[Application] = []
     for job_id in data.job_ids:
+        job_result = await db.execute(select(Job).where(Job.id == job_id))
+        job = job_result.scalar_one_or_none()
+        if job is None:
+            raise RecordNotFoundError("Job", job_id)
+        if tenant_id and job.tenant_id and job.tenant_id != tenant_id:
+            raise ValueError("application_job_tenant_mismatch")
+        if auth.enforced and job.tenant_id != tenant_id:
+            raise ValueError("application_job_tenant_mismatch")
         app = Application(
             tenant_id=tenant_id,
             job_id=job_id,
