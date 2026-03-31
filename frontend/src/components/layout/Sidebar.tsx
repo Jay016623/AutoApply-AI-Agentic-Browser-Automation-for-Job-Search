@@ -11,6 +11,7 @@ import Typography from '@mui/material/Typography';
 import Divider from '@mui/material/Divider';
 import DashboardIcon from '@mui/icons-material/Dashboard';
 import WorkIcon from '@mui/icons-material/Work';
+import PeopleIcon from '@mui/icons-material/People';
 import SendIcon from '@mui/icons-material/Send';
 import DescriptionIcon from '@mui/icons-material/Description';
 import BarChartIcon from '@mui/icons-material/BarChart';
@@ -30,6 +31,7 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { label: 'Dashboard', path: '/dashboard', icon: <DashboardIcon /> },
   { label: 'Job Search', path: '/jobs', icon: <WorkIcon /> },
+  { label: 'Candidates', path: '/candidates', icon: <PeopleIcon /> },
   { label: 'Applications', path: '/applications', icon: <SendIcon /> },
   { label: 'Resumes', path: '/resumes', icon: <DescriptionIcon /> },
   { label: 'Analytics', path: '/analytics', icon: <BarChartIcon /> },
