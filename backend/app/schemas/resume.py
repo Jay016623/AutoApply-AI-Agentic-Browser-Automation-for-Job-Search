@@ -21,6 +21,7 @@ class ResumeGenerateRequest(BaseModel):
 
     base_resume_id: str
     job_id: str
+    candidate_id: str | None = None
     template_id: str = "modern"
     output_formats: list[str] = Field(default_factory=lambda: ["pdf", "docx"])
 

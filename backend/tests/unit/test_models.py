@@ -5,9 +5,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application import Application
+from app.models.candidate import Candidate
+from app.models.candidate_profile_snapshot import CandidateProfileSnapshot
+from app.models.cover_letter_version import CoverLetterVersion
 from app.models.job import Job
 from app.models.llm_usage import LLMUsage
 from app.models.resume import Resume
+from app.models.resume_version import ResumeVersion
 from app.models.user_settings import UserSettings
 
 
@@ -159,3 +163,53 @@ class TestUserSettingsModel:
         assert settings.apply_mode == "review"
         assert settings.max_parallel == 3
         assert settings.min_ats_score == 0.75
+
+
+class TestCandidateDomainModels:
+    """Test candidate-centric models and basic constraints."""
+
+    async def test_create_candidate_and_versions(self, db_session: AsyncSession) -> None:
+        candidate = Candidate(
+            tenant_id="tenant-1",
+            full_name="John Smith",
+            email="john@example.com",
+        )
+        db_session.add(candidate)
+        await db_session.flush()
+
+        snapshot = CandidateProfileSnapshot(
+            tenant_id="tenant-1",
+            candidate_id=candidate.id,
+            version=1,
+            summary="Profile v1",
+            skills=["python"],
+            experience=[],
+            education=[],
+            certifications=[],
+        )
+        resume_version = ResumeVersion(
+            tenant_id="tenant-1",
+            candidate_id=candidate.id,
+            version=1,
+            label="Resume v1",
+            template_id="modern",
+            variant_type="base",
+        )
+        cover_version = CoverLetterVersion(
+            tenant_id="tenant-1",
+            candidate_id=candidate.id,
+            version=1,
+            label="Cover v1",
+            template_id="standard",
+        )
+        db_session.add_all([snapshot, resume_version, cover_version])
+        await db_session.commit()
+
+        result = await db_session.execute(
+            select(Candidate).where(Candidate.id == candidate.id),
+        )
+        fetched = result.scalar_one()
+        assert fetched.email == "john@example.com"
+        assert fetched.profile_snapshots[0].version == 1
+        assert fetched.resume_versions[0].variant_type == "base"
+        assert fetched.cover_letter_versions[0].template_id == "standard"

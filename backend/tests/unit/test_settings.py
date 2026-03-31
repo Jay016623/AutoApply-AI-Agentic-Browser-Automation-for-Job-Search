@@ -2,7 +2,14 @@
 
 
 
-from app.config.settings import ApplyMode, BrowserSettings, Environment, LLMSettings, Settings
+from app.config.settings import (
+    ApplyMode,
+    BrowserSettings,
+    Environment,
+    FeatureFlagsSettings,
+    LLMSettings,
+    Settings,
+)
 
 
 class TestSettings:
@@ -75,3 +82,18 @@ class TestBrowserSettings:
         """Browser should default to headless mode."""
         settings = BrowserSettings()
         assert settings.headless is True
+
+
+class TestFeatureFlagsSettings:
+    """Test feature flag defaults and parsing."""
+
+    def test_feature_flags_default_values(self) -> None:
+        flags = FeatureFlagsSettings()
+        assert flags.tenant_enforcement is False
+        assert flags.workflow_v2_enabled is False
+        assert flags.audit_log_enabled is True
+        assert flags.manual_checkpoint_mode is True
+
+    def test_settings_exposes_feature_flags_object(self) -> None:
+        settings = Settings(_env_file=None)
+        assert isinstance(settings.feature_flags, FeatureFlagsSettings)

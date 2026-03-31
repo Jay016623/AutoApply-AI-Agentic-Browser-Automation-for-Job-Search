@@ -27,6 +27,11 @@ class Resume(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("jobs.id", ondelete="SET NULL"),
         nullable=True,
     )
+    candidate_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("candidates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     # Template used
     template_id: Mapped[str] = mapped_column(String(50), nullable=False, default="modern")
