@@ -1,6 +1,7 @@
 """Queue-backed retry scheduler for failed retryable attempts."""
 
 from datetime import UTC, datetime, timedelta
+import uuid
 
 import structlog
 from redis.asyncio import Redis
@@ -14,63 +15,83 @@ from app.domains.applications.workflow.retry_policy import exponential_backoff_d
 from app.models.application import Application
 from app.models.application_attempt import ApplicationAttempt
 from app.models.job import Job
-from app.services.queue import enqueue
+from app.services.queue import build_envelope, enqueue_envelope
 
 logger = structlog.get_logger(__name__)
 
 
 MAX_RETRIES = 3
+SCHEDULER_LOCK_KEY = "autoapply:lock:retry_scheduler"
+SCHEDULER_LOCK_TTL_SECONDS = 20
 
 
 async def run_retry_cycle(redis: Redis, max_retries: int = MAX_RETRIES, batch_size: int = 50) -> dict[str, int]:
     """Schedule and dispatch retries for retryable attempts."""
+    lock_token = uuid.uuid4().hex
+    acquired = await redis.set(SCHEDULER_LOCK_KEY, lock_token, ex=SCHEDULER_LOCK_TTL_SECONDS, nx=True)
+    if not acquired:
+        logger.debug("retry_scheduler.lock_not_acquired")
+        return {"scheduled": 0, "dispatched": 0, "manual_escalated": 0}
+
     now = datetime.now(UTC)
     scheduled = 0
     dispatched = 0
     manual_escalated = 0
 
-    async with async_session_factory() as db:
-        attempts_result = await db.execute(
-            select(ApplicationAttempt)
-            .where(ApplicationAttempt.status.in_(["failed_retryable", "retry_scheduled"]))
-            .order_by(ApplicationAttempt.updated_at.asc())
-            .limit(batch_size),
-        )
-        attempts = list(attempts_result.scalars().all())
+    try:
+        async with async_session_factory() as db:
+            attempts_result = await db.execute(
+                select(ApplicationAttempt)
+                .where(ApplicationAttempt.status.in_(["failed_retryable", "retry_scheduled"]))
+                .order_by(ApplicationAttempt.updated_at.asc())
+                .limit(batch_size),
+            )
+            attempts = list(attempts_result.scalars().all())
 
-        for attempt in attempts:
-            service = ApplicationAttemptService(db, tenant_scope=attempt.tenant_id)
+            for attempt in attempts:
+                service = ApplicationAttemptService(db, tenant_scope=attempt.tenant_id)
 
-            if attempt.status == "failed_retryable":
-                delay = exponential_backoff_delay(attempt.retry_count + 1)
-                next_retry_at = now + timedelta(seconds=delay)
-                updated = await service.schedule_retry(
-                    attempt.id,
-                    next_retry_at=next_retry_at,
-                    max_retries=max_retries,
-                )
-                if updated.status == "waiting_manual":
-                    manual_escalated += 1
-                else:
-                    scheduled += 1
-                continue
-
-            if attempt.status == "retry_scheduled" and attempt.next_retry_at and attempt.next_retry_at <= now:
-                payload = await _build_retry_payload(db, attempt)
-                if payload is None:
-                    await service.schedule_retry(
+                if attempt.status == "failed_retryable":
+                    delay = exponential_backoff_delay(attempt.retry_count + 1)
+                    next_retry_at = now + timedelta(seconds=delay)
+                    updated = await service.schedule_retry(
                         attempt.id,
-                        next_retry_at=now,
-                        max_retries=0,
+                        next_retry_at=next_retry_at,
+                        max_retries=max_retries,
                     )
-                    manual_escalated += 1
+                    if updated.status == "waiting_manual":
+                        manual_escalated += 1
+                    else:
+                        scheduled += 1
                     continue
 
-                payload["execution_idempotency_key"] = attempt.id
-                payload["retry_count"] = attempt.retry_count
-                await enqueue(redis, QUEUE_APPLY, payload)
-                await service.mark_retry_dispatched(attempt.id)
-                dispatched += 1
+                if attempt.status == "retry_scheduled" and attempt.next_retry_at and attempt.next_retry_at <= now:
+                    payload = await _build_retry_payload(db, attempt)
+                    if payload is None:
+                        await service.schedule_retry(
+                            attempt.id,
+                            next_retry_at=now,
+                            max_retries=0,
+                        )
+                        manual_escalated += 1
+                        continue
+
+                    payload["execution_idempotency_key"] = attempt.id
+                    envelope = build_envelope(
+                        payload=payload,
+                        tenant_id=attempt.tenant_id,
+                        attempt_id=attempt.id,
+                        idempotency_key=attempt.id,
+                        retry_count=attempt.retry_count,
+                        max_retries=max_retries,
+                    )
+                    await enqueue_envelope(redis, QUEUE_APPLY, envelope)
+                    await service.mark_retry_dispatched(attempt.id)
+                    dispatched += 1
+    finally:
+        current_token = await redis.get(SCHEDULER_LOCK_KEY)
+        if current_token is not None and current_token.decode("utf-8") == lock_token:
+            await redis.delete(SCHEDULER_LOCK_KEY)
 
     logger.info(
         "retry_scheduler.cycle_completed",

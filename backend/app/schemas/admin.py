@@ -16,6 +16,7 @@ class QueueDepthResponse(BaseModel):
     """Queue depths for worker operations."""
 
     apply: int
+    apply_dead_letter: int = 0
     scrape: int
     generate: int
 

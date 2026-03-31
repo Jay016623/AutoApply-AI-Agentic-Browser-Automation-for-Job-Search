@@ -33,6 +33,7 @@ from app.models.resume import Resume
 from app.schemas.resume import ResumeGenerateRequest
 from app.services import resume as resume_service
 from app.services.queue import dequeue
+from app.workers.orchestration import process_apply_message
 
 logger = structlog.get_logger(__name__)
 
@@ -869,8 +870,11 @@ async def run_worker() -> None:
         try:
             message = await dequeue(redis, QUEUE_APPLY, timeout=5)
             if message is not None:
-                payload = message.get("payload", {})
-                await process_application(payload)
+                await process_apply_message(
+                    redis=redis,
+                    message=message,
+                    handler=process_application,
+                )
         except Exception as exc:
             logger.error("worker.loop_error", error=str(exc))
             await asyncio.sleep(1)

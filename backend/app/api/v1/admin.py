@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import AuthContext, get_auth_context, get_db, get_redis
 from app.core.auth import Role, ensure_role
 from app.core.principal import issue_principal_token
-from app.config.constants import QUEUE_APPLY, QUEUE_GENERATE, QUEUE_SCRAPE
+from app.config.constants import QUEUE_APPLY, QUEUE_APPLY_DEAD_LETTER, QUEUE_GENERATE, QUEUE_SCRAPE
 from app.config.settings import get_settings
 from app.db.redis import is_redis_available
 from app.models.tenant_membership import TenantMembership
@@ -46,14 +46,16 @@ async def queue_depths(
     """Return queue backlog depths for operational visibility."""
     ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.OPERATOR})
     if redis is None:
-        return QueueDepthResponse(apply=0, scrape=0, generate=0)
+        return QueueDepthResponse(apply=0, apply_dead_letter=0, scrape=0, generate=0)
 
     apply_depth = await get_queue_depth(redis, QUEUE_APPLY)
+    apply_dead_letter_depth = await get_queue_depth(redis, QUEUE_APPLY_DEAD_LETTER)
     scrape_depth = await get_queue_depth(redis, QUEUE_SCRAPE)
     generate_depth = await get_queue_depth(redis, QUEUE_GENERATE)
 
     return QueueDepthResponse(
         apply=apply_depth,
+        apply_dead_letter=apply_dead_letter_depth,
         scrape=scrape_depth,
         generate=generate_depth,
     )
