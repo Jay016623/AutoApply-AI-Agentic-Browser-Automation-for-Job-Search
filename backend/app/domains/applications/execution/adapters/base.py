@@ -60,6 +60,7 @@ class ExecutionContext:
     cover_letter_path: str | None = None
     manual_checkpoint_mode: bool = False
     manual_checkpoint_reason: str | None = None
+    verification_hints: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -80,7 +81,11 @@ class VerificationResult:
     """Result of deterministic verification step."""
 
     verified: bool
+    classification: str
     reason: str | None = None
+    retryable: bool = False
+    requires_manual_checkpoint: bool = False
+    evidence: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)

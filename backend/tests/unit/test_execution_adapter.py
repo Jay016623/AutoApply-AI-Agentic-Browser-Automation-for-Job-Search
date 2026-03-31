@@ -31,6 +31,7 @@ def _context(platform: str = "linkedin", manual_mode: bool = False) -> Execution
         resume_path="/tmp/resume.pdf",
         manual_checkpoint_mode=manual_mode,
         manual_checkpoint_reason="operator requested" if manual_mode else None,
+        verification_hints={},
     )
 
 
@@ -67,10 +68,18 @@ class TestPlatformApplyAdapter:
         assert result.error_code == "PLATFORM_APPLY_FAILED"
         assert adapter.classify_failure(result) == AdapterFailureClass.RETRYABLE
 
-    async def test_success_has_verification_and_artifacts(self):
+    async def test_success_with_strong_evidence_is_confirmed(self):
         adapter = PlatformApplyAdapter()
         mock_platform = AsyncMock()
-        mock_platform.apply = AsyncMock(return_value=True)
+        mock_platform.apply = AsyncMock(
+            return_value={
+                "submitted": True,
+                "current_url": "https://www.linkedin.com/jobs/application-complete",
+                "page_text": "Your application has been submitted",
+                "dom_markers": ["submission-confirmation"],
+                "submission_id": "ABC-123",
+            },
+        )
 
         with patch("app.domains.applications.execution.adapters.platform_apply.platform_registry") as mock_registry:
             mock_registry.has.return_value = True
@@ -82,5 +91,43 @@ class TestPlatformApplyAdapter:
 
         assert result.success is True
         assert verification.verified is True
+        assert verification.classification == "confirmed_success"
         assert len(artifacts) >= 1
         assert adapter.classify_failure(result) == AdapterFailureClass.NONE
+
+    async def test_success_without_evidence_is_uncertain_manual_checkpoint(self):
+        adapter = PlatformApplyAdapter()
+        mock_platform = AsyncMock()
+        mock_platform.apply = AsyncMock(return_value=True)
+
+        with patch("app.domains.applications.execution.adapters.platform_apply.platform_registry") as mock_registry:
+            mock_registry.has.return_value = True
+            mock_registry.create.return_value = mock_platform
+            result = await adapter.execute(_context())
+
+        verification = adapter.verify(result)
+        assert verification.verified is False
+        assert verification.classification == "uncertain"
+        assert verification.requires_manual_checkpoint is True
+
+    async def test_failure_markers_are_retryable_failed(self):
+        adapter = PlatformApplyAdapter()
+        mock_platform = AsyncMock()
+        mock_platform.apply = AsyncMock(
+            return_value={
+                "submitted": True,
+                "current_url": "https://www.indeed.com/apply",
+                "page_text": "There was an error submitting your application. Please try again.",
+                "dom_markers": ["error-banner"],
+            },
+        )
+
+        with patch("app.domains.applications.execution.adapters.platform_apply.platform_registry") as mock_registry:
+            mock_registry.has.return_value = True
+            mock_registry.create.return_value = mock_platform
+            result = await adapter.execute(_context(platform="indeed"))
+
+        verification = adapter.verify(result)
+        assert verification.verified is False
+        assert verification.classification == "failed"
+        assert verification.retryable is True

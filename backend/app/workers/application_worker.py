@@ -182,6 +182,7 @@ async def _execute_attempt_path(
                     resume_path=resume_path,
                     manual_checkpoint_mode=bool(payload.get("manual_checkpoint_mode")),
                     manual_checkpoint_reason=manual_reason,
+                    verification_hints=payload.get("verification_evidence", {}) or {},
                 )
                 prepared_context = await adapter.prepare(exec_context)
                 adapter_result = await adapter.execute(prepared_context)
@@ -214,8 +215,12 @@ async def _execute_attempt_path(
                         step_id=step.id,
                         error_code="SUBMISSION_NOT_VERIFIED",
                         error_message=verification_result.reason or "Submission verification failed",
-                        retryable=False,
-                        manual_checkpoint_reason=verification_result.reason or "verification_failed",
+                        retryable=verification_result.retryable,
+                        manual_checkpoint_reason=(
+                            verification_result.reason or "verification_failed"
+                            if verification_result.requires_manual_checkpoint or not verification_result.retryable
+                            else None
+                        ),
                     )
                     return False, verification_result.reason or "Submission verification failed"
                 await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"verified": True})
@@ -248,6 +253,9 @@ async def _execute_attempt_path(
                         "artifact_count": len(artifacts),
                         "artifact_id": last_artifact.id if last_artifact else None,
                         "verification": verification_result.verified if verification_result else False,
+                        "verification_classification": (
+                            verification_result.classification if verification_result else "failed"
+                        ),
                     },
                 )
 

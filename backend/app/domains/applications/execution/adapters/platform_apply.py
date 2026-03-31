@@ -7,6 +7,8 @@ result shape, and failure classification.
 
 from __future__ import annotations
 
+import re
+
 from app.core.automation.platforms import platform_registry
 from app.domains.applications.execution.adapters.base import (
     AdapterCapability,
@@ -69,32 +71,88 @@ class PlatformApplyAdapter(ExecutionAdapter):
             )
 
         platform = platform_registry.create(context.platform_name)
-        applied = await platform.apply(
+        apply_output = await platform.apply(
             job=context.job_listing,
             resume_path=context.resume_path,
             cover_letter_path=context.cover_letter_path,
         )
-        if not applied:
+        normalized = self._normalize_apply_output(apply_output, context)
+        if not normalized["applied"]:
             return ExecutionResult(
                 success=False,
                 submitted=False,
                 error_code="PLATFORM_APPLY_FAILED",
                 error_message="Platform returned unsuccessful apply result",
-                metadata={"platform": context.platform_name},
+                metadata=normalized["metadata"],
             )
 
         return ExecutionResult(
             success=True,
             submitted=True,
-            metadata={"platform": context.platform_name},
+            metadata=normalized["metadata"],
         )
 
     def verify(self, result: ExecutionResult) -> VerificationResult:
-        # Deterministic in contract only; verification remains weak because
-        # plugin apply() lacks durable platform-side receipt validation.
-        if result.submitted and result.success:
-            return VerificationResult(verified=True)
-        return VerificationResult(verified=False, reason=result.error_message)
+        metadata = result.metadata or {}
+        evidence = metadata.get("verification_evidence", {})
+        platform = metadata.get("platform", "")
+        text_blob = " ".join(
+            [
+                str(evidence.get("page_text", "")),
+                " ".join([str(m) for m in evidence.get("text_markers", [])]),
+            ],
+        ).lower()
+        current_url = str(evidence.get("current_url", "")).lower()
+        dom_markers = [str(marker).lower() for marker in evidence.get("dom_markers", [])]
+        submission_id = evidence.get("submission_id")
+
+        failure_phrases = ("not submitted", "submission failed", "try again", "error submitting")
+        if any(phrase in text_blob for phrase in failure_phrases):
+            return VerificationResult(
+                verified=False,
+                classification="failed",
+                reason="Confirmation page contains explicit failure signal",
+                retryable=True,
+                evidence=evidence,
+            )
+
+        success_phrase_hits = sum(phrase in text_blob for phrase in self._success_phrases(platform))
+        dom_hits = sum(marker in marker_text for marker_text in dom_markers for marker in self._dom_markers(platform))
+        url_hit = any(re.search(pattern, current_url) for pattern in self._url_patterns(platform))
+        has_submission_id = bool(submission_id)
+
+        strong_signal_count = int(url_hit) + int(dom_hits > 0) + int(success_phrase_hits > 0) + int(has_submission_id)
+        if strong_signal_count >= 2 or (has_submission_id and (url_hit or success_phrase_hits > 0)):
+            return VerificationResult(
+                verified=True,
+                classification="confirmed_success",
+                evidence={
+                    **evidence,
+                    "signal_counts": {
+                        "url_hit": url_hit,
+                        "dom_hits": dom_hits,
+                        "success_phrase_hits": success_phrase_hits,
+                        "has_submission_id": has_submission_id,
+                    },
+                },
+            )
+
+        if result.success and result.submitted:
+            return VerificationResult(
+                verified=False,
+                classification="uncertain",
+                reason="Apply returned success but no strong confirmation evidence found",
+                requires_manual_checkpoint=True,
+                evidence=evidence,
+            )
+
+        return VerificationResult(
+            verified=False,
+            classification="failed",
+            reason=result.error_message or "Execution did not submit application",
+            retryable=True,
+            evidence=evidence,
+        )
 
     def collect_artifacts(self, result: ExecutionResult) -> list[ArtifactRecord]:
         artifacts = [
@@ -105,6 +163,11 @@ class PlatformApplyAdapter(ExecutionAdapter):
                     "platform": result.metadata.get("platform", "unknown"),
                     "success": result.success,
                 },
+            ),
+            ArtifactRecord(
+                artifact_type="verification_evidence",
+                storage_path=f"attempt://adapter/{self.capability.adapter_name}/verification",
+                metadata=result.metadata.get("verification_evidence", {}),
             ),
         ]
         if result.error_code:
@@ -125,3 +188,61 @@ class PlatformApplyAdapter(ExecutionAdapter):
         if result.needs_manual_checkpoint or result.error_code == "MANUAL_CHECKPOINT":
             return AdapterFailureClass.MANUAL_CHECKPOINT
         return AdapterFailureClass.RETRYABLE
+
+    def _normalize_apply_output(self, apply_output: object, context: ExecutionContext) -> dict[str, object]:
+        evidence: dict[str, object] = {}
+        applied = False
+
+        if isinstance(apply_output, bool):
+            applied = apply_output
+        elif isinstance(apply_output, dict):
+            applied = bool(apply_output.get("submitted"))
+            evidence = {
+                "current_url": apply_output.get("current_url"),
+                "page_text": apply_output.get("page_text"),
+                "dom_markers": apply_output.get("dom_markers", []),
+                "text_markers": apply_output.get("text_markers", []),
+                "submission_id": apply_output.get("submission_id"),
+                "dom_snapshot_path": apply_output.get("dom_snapshot_path"),
+            }
+
+        if context.verification_hints:
+            evidence = {**evidence, **context.verification_hints}
+
+        metadata = {
+            "platform": context.platform_name,
+            "verification_evidence": evidence,
+        }
+        return {"applied": applied, "metadata": metadata}
+
+    def _success_phrases(self, platform: str) -> tuple[str, ...]:
+        common = (
+            "application submitted",
+            "your application has been submitted",
+            "application sent",
+            "thanks for applying",
+        )
+        platform_specific = {
+            "linkedin": ("easy apply application submitted",),
+            "indeed": ("application complete",),
+            "glassdoor": ("application submitted successfully",),
+        }
+        return common + platform_specific.get(platform, ())
+
+    def _dom_markers(self, platform: str) -> tuple[str, ...]:
+        common = ("confirmation", "application-success", "submission-confirmation")
+        platform_specific = {
+            "linkedin": ("jobs-apply-modal", "artdeco-inline-feedback"),
+            "indeed": ("ia-application-complete", "jobsearch-IndeedApplyButton"),
+            "glassdoor": ("applicationConfirmation",),
+        }
+        return common + platform_specific.get(platform, ())
+
+    def _url_patterns(self, platform: str) -> tuple[str, ...]:
+        common = (r"/application[-_/]confirmation", r"/apply/complete", r"/submitted")
+        platform_specific = {
+            "linkedin": (r"linkedin\\.com/.*/jobs/.*/(complete|submitted)",),
+            "indeed": (r"indeed\\.com/.*/apply.*(confirmation|complete)",),
+            "glassdoor": (r"glassdoor\\.com/.*/application.*(complete|submitted)",),
+        }
+        return common + platform_specific.get(platform, ())
