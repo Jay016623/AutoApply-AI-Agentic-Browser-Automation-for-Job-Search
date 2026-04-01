@@ -40,6 +40,7 @@ from app.schemas.resume import (
     ResumeUploadResponse,
 )
 from app.schemas.settings import LLMProviderStatus, SettingsResponse, SettingsUpdate
+from app.schemas.review import ReviewActionRequest, ReviewTaskListResponse, ReviewTaskResponse
 from app.schemas.execution import (
     ArtifactDownloadUrlResponse,
     ExecutionAttemptListResponse,
@@ -94,4 +95,7 @@ __all__ = [
     "SettingsResponse",
     "SettingsUpdate",
     "TimelineEntry",
+    "ReviewTaskResponse",
+    "ReviewActionRequest",
+    "ReviewTaskListResponse",
 ]

@@ -32,11 +32,53 @@ from app.models.application import Application
 from app.models.job import Job
 from app.models.resume import Resume
 from app.schemas.resume import ResumeGenerateRequest
-from app.services import resume as resume_service
+from app.schemas.review import ReviewTaskCreate
+from app.services import resume as resume_service, review_queue
 from app.services.queue import dequeue
 from app.workers.orchestration import process_apply_message
 
 logger = structlog.get_logger(__name__)
+
+
+
+def _map_failure_category_to_review_reason(category: str | None, manual_reason: str | None = None) -> str:
+    category = (category or "").lower()
+    reason = (manual_reason or "").lower()
+    if "incomplete" in reason or "missing" in reason:
+        return "incomplete_answers"
+    if category in {"auth_expired", "captcha"}:
+        return "captcha_or_auth_block"
+    if category in {"unsupported_ui"}:
+        return "unsupported_ui"
+    if category in {"duplicate_application"}:
+        return "duplicate_risk"
+    if category in {"unknown", "selector_drift", "timeout", "upload_failed"}:
+        return "uncertain_submission"
+    return "uncertain_submission"
+
+
+async def _create_review_task(
+    *,
+    tenant_id: str | None,
+    application_id: str,
+    workflow_run_id: str,
+    reason: str,
+    details: dict[str, Any],
+    idempotency_key: str,
+) -> None:
+    async with async_session_factory() as db:
+        await review_queue.create_review_task(
+            db,
+            ReviewTaskCreate(
+                tenant_id=tenant_id,
+                application_id=application_id,
+                workflow_run_id=workflow_run_id,
+                reason=reason,
+                risk_level="high",
+                details_json=details,
+                idempotency_key=idempotency_key,
+            ),
+        )
 
 _WORKFLOW_PROGRESS_ORDER: list[WorkflowState] = [
     WorkflowState.DISCOVERED,
@@ -642,11 +684,29 @@ async def process_application(payload: dict[str, Any]) -> None:
                 else:
                     logger.info("worker.no_base_resume", app_id=app_id)
             except Exception as exc:
+                error_msg = f"Resume tailoring risk detected: {exc}"
                 logger.warning(
                     "worker.resume_generation_failed",
                     app_id=app_id,
                     error=str(exc),
                 )
+                await _update_application_status(app_id, ApplicationStatus.FAILED, notes=error_msg)
+                await _transition_workflow_state(
+                    workflow_run_id,
+                    WorkflowState.FAILED_MANUAL,
+                    idempotency_key=f"{app_id}:failed-tailoring-risk",
+                    step_name="tailor_resume",
+                    error_message=error_msg,
+                )
+                await _create_review_task(
+                    tenant_id=job.tenant_id,
+                    application_id=app_id,
+                    workflow_run_id=workflow_run_id,
+                    reason="risky_tailoring",
+                    details={"message": error_msg},
+                    idempotency_key=f"{app_id}:review:risky-tailoring",
+                )
+                return
 
             workflow_state = await _transition_workflow_state(
                 workflow_run_id,
@@ -699,6 +759,14 @@ async def process_application(payload: dict[str, Any]) -> None:
                     step_name="score_ats",
                     error_message=skip_msg,
                 )
+                await _create_review_task(
+                    tenant_id=job.tenant_id,
+                    application_id=app_id,
+                    workflow_run_id=workflow_run_id,
+                    reason="low_confidence_match",
+                    details={"ats_score": ats_score, "threshold": min_score, "message": skip_msg},
+                    idempotency_key=f"{app_id}:review:low-confidence-match",
+                )
                 return
 
             workflow_state = await _transition_workflow_state(
@@ -749,6 +817,18 @@ async def process_application(payload: dict[str, Any]) -> None:
                         idempotency_key=f"{app_id}:manual-checkpoint:{submit_failure_category or 'unknown'}",
                         step_name="submit_application",
                         error_message=submit_error,
+                    )
+                    await _create_review_task(
+                        tenant_id=job.tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        reason=_map_failure_category_to_review_reason(submit_failure_category, payload.get("manual_checkpoint_reason")),
+                        details={
+                            "submit_error": submit_error,
+                            "failure_category": submit_failure_category,
+                            "manual_checkpoint_mode": bool(payload.get("manual_checkpoint_mode")),
+                        },
+                        idempotency_key=f"{app_id}:review:submit:{submit_failure_category or 'unknown'}",
                     )
                 else:
                     await _update_application_status(

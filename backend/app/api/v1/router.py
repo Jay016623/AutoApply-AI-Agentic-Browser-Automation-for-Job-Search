@@ -8,6 +8,7 @@ from app.api.v1.applications import router as applications_router
 from app.api.v1.candidates import router as candidates_router
 from app.api.v1.execution import router as execution_router
 from app.api.v1.jobs import router as jobs_router
+from app.api.v1.review import router as review_router
 from app.api.v1.resumes import router as resumes_router
 from app.api.v1.settings import router as settings_router
 
@@ -21,3 +22,5 @@ v1_router.include_router(resumes_router, prefix="/resumes", tags=["Resumes"])
 v1_router.include_router(analytics_router, prefix="/analytics", tags=["Analytics"])
 v1_router.include_router(settings_router, prefix="/settings", tags=["Settings"])
 v1_router.include_router(admin_router, prefix="/admin", tags=["Admin"])
+
+v1_router.include_router(review_router, prefix="/review", tags=["Review Queue"])

@@ -11,6 +11,7 @@ from app.models.cover_letter_version import CoverLetterVersion
 from app.models.job import Job
 from app.models.llm_usage import LLMUsage
 from app.models.proof_artifact import ProofArtifact
+from app.models.review_task import ReviewTask
 from app.models.resume import Resume
 from app.models.resume_version import ResumeVersion
 from app.models.tenant import Tenant
@@ -32,6 +33,7 @@ __all__ = [
     "Job",
     "LLMUsage",
     "ProofArtifact",
+    "ReviewTask",
     "Resume",
     "ResumeVersion",
     "Tenant",

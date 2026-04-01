@@ -20,4 +20,7 @@ __all__ = [
     "retry_scheduler",
     "queue",
     "resume",
+    "review_queue",
 ]
+
+from . import review_queue
