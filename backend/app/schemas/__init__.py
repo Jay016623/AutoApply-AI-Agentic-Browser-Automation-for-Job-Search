@@ -48,6 +48,8 @@ from app.schemas.execution import (
     ExecutionStepResponse,
     ProofArtifactListResponse,
     ProofArtifactResponse,
+    TimelineEventResponse,
+    TimelineResponse,
 )
 
 __all__ = [
@@ -67,6 +69,8 @@ __all__ = [
     "ExecutionAttemptResponse",
     "ExecutionAttemptListResponse",
     "ArtifactDownloadUrlResponse",
+    "TimelineResponse",
+    "TimelineEventResponse",
     # candidate
     "CandidateCreate",
     "CandidateListResponse",

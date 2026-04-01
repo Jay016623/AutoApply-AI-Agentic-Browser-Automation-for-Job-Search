@@ -13,8 +13,10 @@ from app.schemas.execution import (
     ExecutionStepResponse,
     ProofArtifactListResponse,
     ArtifactDownloadUrlResponse,
+    TimelineResponse,
 )
 from app.services import execution_query as execution_service
+from app.services import timeline_query
 
 router = APIRouter()
 
@@ -110,3 +112,39 @@ async def artifact_download_url(
     auth: AuthContext = Depends(get_auth_context),
 ) -> ArtifactDownloadUrlResponse:
     return await execution_service.get_artifact_download_url(db, auth, artifact_id)
+
+
+@router.get("/timeline/execution", response_model=TimelineResponse)
+async def execution_timeline(
+    application_id: str | None = Query(default=None),
+    workflow_run_id: str | None = Query(default=None),
+    attempt_id: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+) -> TimelineResponse:
+    return await timeline_query.execution_timeline(
+        db,
+        auth,
+        application_id=application_id,
+        workflow_run_id=workflow_run_id,
+        attempt_id=attempt_id,
+    )
+
+
+@router.get("/timeline/audit", response_model=TimelineResponse)
+async def audit_timeline(
+    application_id: str | None = Query(default=None),
+    workflow_run_id: str | None = Query(default=None),
+    attempt_id: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+) -> TimelineResponse:
+    return await timeline_query.audit_timeline(
+        db,
+        auth,
+        application_id=application_id,
+        workflow_run_id=workflow_run_id,
+        attempt_id=attempt_id,
+        limit=limit,
+    )

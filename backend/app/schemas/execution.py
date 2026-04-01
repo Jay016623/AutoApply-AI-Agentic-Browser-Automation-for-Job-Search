@@ -93,3 +93,29 @@ class ArtifactDownloadUrlResponse(BaseModel):
     artifact_id: str
     expires_in_seconds: int
     url: str
+
+
+class TimelineEventResponse(BaseModel):
+    event_id: str
+    category: str
+    event_type: str
+    occurred_at: datetime
+    tenant_id: str | None = None
+    application_id: str | None = None
+    workflow_run_id: str | None = None
+    attempt_id: str | None = None
+    trace_id: str | None = None
+    actor_id: str | None = None
+    actor_type: str | None = None
+    state_from: str | None = None
+    state_to: str | None = None
+    failure_classification: str | None = None
+    artifact_id: str | None = None
+    artifact_type: str | None = None
+    status: str | None = None
+    message: str | None = None
+    payload: dict | None = None
+
+
+class TimelineResponse(BaseModel):
+    items: list[TimelineEventResponse]
