@@ -41,6 +41,7 @@ from app.schemas.resume import (
 )
 from app.schemas.settings import LLMProviderStatus, SettingsResponse, SettingsUpdate
 from app.schemas.execution import (
+    ArtifactDownloadUrlResponse,
     ExecutionAttemptListResponse,
     ExecutionAttemptResponse,
     ExecutionStepResponse,
@@ -64,6 +65,7 @@ __all__ = [
     "ExecutionStepResponse",
     "ExecutionAttemptResponse",
     "ExecutionAttemptListResponse",
+    "ArtifactDownloadUrlResponse",
     # candidate
     "CandidateCreate",
     "CandidateListResponse",

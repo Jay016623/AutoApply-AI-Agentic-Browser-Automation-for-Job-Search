@@ -1,6 +1,6 @@
 """Proof artifacts captured during application execution."""
 
-from sqlalchemy import JSON, ForeignKey, Index, String
+from sqlalchemy import JSON, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -15,6 +15,7 @@ class ProofArtifact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_proof_application", "application_id"),
         Index("ix_proof_attempt", "attempt_id"),
         Index("ix_proof_type", "artifact_type"),
+        Index("ix_proof_backend", "storage_backend"),
     )
 
     tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -42,6 +43,11 @@ class ProofArtifact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     artifact_type: Mapped[str] = mapped_column(String(40), nullable=False)
     storage_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    storage_backend: Mapped[str] = mapped_column(String(32), nullable=False, default="local")
+    object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    bucket_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
     metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 

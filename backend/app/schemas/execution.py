@@ -70,7 +70,13 @@ class ProofArtifactResponse(BaseModel):
     artifact_type: str
     storage_path: str
     checksum: str | None = None
+    storage_backend: str
+    object_key: str | None = None
+    bucket_name: str | None = None
+    content_type: str | None = None
+    size_bytes: int | None = None
     metadata_json: dict | None = None
+    temporary_download_url: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -81,3 +87,9 @@ class ProofArtifactListResponse(BaseModel):
     page: int
     page_size: int
     has_next: bool
+
+
+class ArtifactDownloadUrlResponse(BaseModel):
+    artifact_id: str
+    expires_in_seconds: int
+    url: str

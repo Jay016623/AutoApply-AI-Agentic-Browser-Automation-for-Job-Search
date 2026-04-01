@@ -137,6 +137,14 @@ class Settings(BaseSettings):
     artifact_storage_provider: str = "local"
     artifact_storage_local_root: str = "./data/artifacts"
 
+    artifact_storage_s3_bucket: str = ""
+    artifact_storage_s3_region: str = "us-east-1"
+    artifact_storage_s3_endpoint_url: str = ""
+    artifact_storage_s3_access_key_id: SecretStr = SecretStr("")
+    artifact_storage_s3_secret_access_key: SecretStr = SecretStr("")
+    artifact_storage_s3_session_token: SecretStr = SecretStr("")
+    artifact_storage_presign_ttl_seconds: int = 900
+
     # Startup behavior
     auto_create_schema_on_startup: bool = False
 

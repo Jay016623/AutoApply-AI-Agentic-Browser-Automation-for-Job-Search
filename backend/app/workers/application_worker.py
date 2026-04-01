@@ -7,6 +7,7 @@ score with ATS, apply via platform, and broadcast progress.
 
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -286,25 +287,43 @@ async def _execute_attempt_path(
                 last_artifact = None
                 for artifact in artifacts:
                     payload_metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {"value": str(artifact.metadata)}
-                    last_artifact = await attempt_service.store_structured_artifact(
-                        tenant_id=tenant_id,
-                        application_id=app_id,
-                        workflow_run_id=workflow_run_id,
-                        attempt_id=attempt.id,
-                        attempt_step_id=step.id,
-                        artifact_type=artifact.artifact_type,
-                        payload={
-                            "source_path": artifact.storage_path,
-                            "step_name": step_name,
-                            "verification_classification": verification_result.classification if verification_result else "failed",
-                            "metadata": payload_metadata,
-                        },
-                        metadata_json={
-                            "category": "adapter_artifact",
-                            "verification_linked": True,
-                            "source_path": artifact.storage_path,
-                        },
-                    )
+                    source_file_path = payload_metadata.get("path") if isinstance(payload_metadata, dict) else None
+                    if isinstance(source_file_path, str) and Path(source_file_path).exists():
+                        last_artifact = await attempt_service.store_file_artifact(
+                            tenant_id=tenant_id,
+                            application_id=app_id,
+                            workflow_run_id=workflow_run_id,
+                            attempt_id=attempt.id,
+                            attempt_step_id=step.id,
+                            artifact_type=artifact.artifact_type,
+                            source_path=source_file_path,
+                            metadata_json={
+                                "category": "adapter_artifact",
+                                "verification_linked": True,
+                                "source_path": artifact.storage_path,
+                                "captured_path": source_file_path,
+                            },
+                        )
+                    else:
+                        last_artifact = await attempt_service.store_structured_artifact(
+                            tenant_id=tenant_id,
+                            application_id=app_id,
+                            workflow_run_id=workflow_run_id,
+                            attempt_id=attempt.id,
+                            attempt_step_id=step.id,
+                            artifact_type=artifact.artifact_type,
+                            payload={
+                                "source_path": artifact.storage_path,
+                                "step_name": step_name,
+                                "verification_classification": verification_result.classification if verification_result else "failed",
+                                "metadata": payload_metadata,
+                            },
+                            metadata_json={
+                                "category": "adapter_artifact",
+                                "verification_linked": True,
+                                "source_path": artifact.storage_path,
+                            },
+                        )
                 await attempt_service.record_step_completed(
                     step_id=step.id,
                     output_snapshot_json={

@@ -6,12 +6,15 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+from app.config.settings import get_settings
 from app.core.auth import AuthContext, Role, ensure_role, require_tenant
 from app.core.exceptions import RecordNotFoundError
 from app.models.application_attempt import ApplicationAttempt
 from app.models.application_attempt_step import ApplicationAttemptStep
 from app.models.proof_artifact import ProofArtifact
+from app.services.artifacts import get_artifact_storage
 from app.schemas.execution import (
+    ArtifactDownloadUrlResponse,
     ExecutionAttemptListResponse,
     ExecutionAttemptResponse,
     ExecutionStepResponse,
@@ -145,6 +148,28 @@ async def list_attempt_artifacts(
         page_size=page_size,
         has_next=(page * page_size) < total,
     )
+
+
+async def get_artifact_download_url(db: AsyncSession, auth: AuthContext, artifact_id: str) -> ArtifactDownloadUrlResponse:
+    ensure_role(auth, _READ_ROLES)
+    query = select(ProofArtifact).where(ProofArtifact.id == artifact_id)
+    if auth.enforced:
+        query = query.where(ProofArtifact.tenant_id == require_tenant(auth))
+    elif auth.tenant_id:
+        query = query.where(ProofArtifact.tenant_id == auth.tenant_id)
+    row = (await db.execute(query)).scalar_one_or_none()
+    if row is None:
+        raise RecordNotFoundError("ProofArtifact", artifact_id)
+
+    settings = get_settings()
+    storage = get_artifact_storage()
+    expires = settings.artifact_storage_presign_ttl_seconds
+    url = await storage.get_temporary_download_url(
+        storage_path=row.storage_path,
+        object_key=row.object_key,
+        expires_in_seconds=expires,
+    )
+    return ArtifactDownloadUrlResponse(artifact_id=row.id, expires_in_seconds=expires, url=url)
 
 
 async def list_manual_queue(

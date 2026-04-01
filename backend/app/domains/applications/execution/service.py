@@ -1,7 +1,10 @@
 """Durable execution service for application attempts."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+
+import mimetypes
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -280,6 +283,11 @@ class ApplicationAttemptService:
         artifact_type: str,
         storage_path: str,
         checksum: str | None = None,
+        storage_backend: str = "local",
+        object_key: str | None = None,
+        bucket_name: str | None = None,
+        content_type: str | None = None,
+        size_bytes: int | None = None,
         metadata_json: dict[str, Any] | None = None,
     ) -> ProofArtifact:
         artifact = ProofArtifact(
@@ -291,6 +299,11 @@ class ApplicationAttemptService:
             artifact_type=artifact_type,
             storage_path=storage_path,
             checksum=checksum,
+            storage_backend=storage_backend,
+            object_key=object_key,
+            bucket_name=bucket_name,
+            content_type=content_type,
+            size_bytes=size_bytes,
             metadata_json=metadata_json,
         )
         self._db.add(artifact)
@@ -328,7 +341,10 @@ class ApplicationAttemptService:
         merged_metadata = {
             **(metadata_json or {}),
             "storage_backend": stored.backend,
+            "object_key": stored.object_key,
+            "bucket_name": stored.bucket_name,
             "size_bytes": stored.size_bytes,
+            "content_type": stored.content_type,
         }
         return await self.create_proof_artifact(
             tenant_id=tenant_id,
@@ -339,7 +355,70 @@ class ApplicationAttemptService:
             artifact_type=artifact_type,
             storage_path=stored.storage_path,
             checksum=stored.checksum,
+            storage_backend=stored.backend,
+            object_key=stored.object_key,
+            bucket_name=stored.bucket_name,
+            content_type=stored.content_type,
+            size_bytes=stored.size_bytes,
             metadata_json=merged_metadata,
+        )
+
+    async def store_file_artifact(
+        self,
+        *,
+        tenant_id: str | None,
+        application_id: str | None,
+        workflow_run_id: str | None,
+        attempt_id: str | None,
+        attempt_step_id: str | None,
+        artifact_type: str,
+        source_path: str,
+        metadata_json: dict[str, Any] | None = None,
+    ) -> ProofArtifact:
+        file_path = Path(source_path)
+        payload = file_path.read_bytes()
+        guessed_type, _ = mimetypes.guess_type(file_path.name)
+        extension = file_path.suffix.lstrip(".") or None
+        stored = await self._artifact_storage.store_bytes(
+            tenant_id=tenant_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            payload=payload,
+            extension=extension,
+            content_type=guessed_type,
+        )
+        merged_metadata = {
+            **(metadata_json or {}),
+            "storage_backend": stored.backend,
+            "object_key": stored.object_key,
+            "bucket_name": stored.bucket_name,
+            "size_bytes": stored.size_bytes,
+            "content_type": stored.content_type,
+            "source_path": source_path,
+        }
+        return await self.create_proof_artifact(
+            tenant_id=tenant_id,
+            application_id=application_id,
+            workflow_run_id=workflow_run_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            storage_path=stored.storage_path,
+            checksum=stored.checksum,
+            storage_backend=stored.backend,
+            object_key=stored.object_key,
+            bucket_name=stored.bucket_name,
+            content_type=stored.content_type,
+            size_bytes=stored.size_bytes,
+            metadata_json=merged_metadata,
+        )
+
+    async def get_artifact_download_url(self, artifact: ProofArtifact, *, expires_in_seconds: int) -> str:
+        return await self._artifact_storage.get_temporary_download_url(
+            storage_path=artifact.storage_path,
+            object_key=artifact.object_key,
+            expires_in_seconds=expires_in_seconds,
         )
 
     async def get_resume_sequence(self, attempt_id: str) -> int:

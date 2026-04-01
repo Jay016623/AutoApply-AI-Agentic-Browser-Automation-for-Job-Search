@@ -1,15 +1,36 @@
-"""Artifact storage abstraction with local backend and cloud-ready interface."""
+"""Artifact storage abstraction with local and S3-compatible backends."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import mimetypes
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from app.config.settings import get_settings
+
+_SAFE_SEGMENT_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def _safe_segment(value: str | None, *, default: str) -> str:
+    normalized = _SAFE_SEGMENT_PATTERN.sub("-", (value or "").strip()).strip("-._")
+    return (normalized or default)[:120]
+
+
+def _normalize_extension(extension: str | None, content_type: str | None) -> str:
+    if extension:
+        ext = extension.strip().lower().lstrip(".")
+        if ext:
+            return ext
+    if content_type:
+        guessed = mimetypes.guess_extension(content_type, strict=False)
+        if guessed:
+            return guessed.lstrip(".")
+    return "bin"
 
 
 @dataclass(slots=True, frozen=True)
@@ -20,6 +41,9 @@ class StoredArtifact:
     checksum: str
     size_bytes: int
     backend: str
+    object_key: str
+    bucket_name: str | None = None
+    content_type: str | None = None
 
 
 class ArtifactStorage:
@@ -35,7 +59,8 @@ class ArtifactStorage:
         attempt_step_id: str | None,
         artifact_type: str,
         payload: bytes,
-        extension: str,
+        extension: str | None = None,
+        content_type: str | None = None,
     ) -> StoredArtifact:
         raise NotImplementedError
 
@@ -56,6 +81,34 @@ class ArtifactStorage:
             artifact_type=artifact_type,
             payload=data,
             extension="json",
+            content_type="application/json",
+        )
+
+    async def get_temporary_download_url(self, *, storage_path: str, object_key: str | None, expires_in_seconds: int) -> str:
+        """Return a temporary/non-public retrieval URL for this backend."""
+
+        return storage_path
+
+    def build_object_key(
+        self,
+        *,
+        tenant_id: str | None,
+        attempt_id: str | None,
+        attempt_step_id: str | None,
+        artifact_type: str,
+        extension: str | None,
+        content_type: str | None,
+    ) -> str:
+        now = datetime.now(UTC)
+        safe_tenant = _safe_segment(tenant_id, default="tenant-unknown")
+        safe_attempt = _safe_segment(attempt_id, default="attempt-unknown")
+        safe_step = _safe_segment(attempt_step_id, default="step-global")
+        safe_type = _safe_segment(artifact_type, default="artifact")
+        safe_ext = _normalize_extension(extension, content_type)
+        return (
+            f"tenant={safe_tenant}/year={now:%Y}/month={now:%m}/day={now:%d}/"
+            f"attempt={safe_attempt}/step={safe_step}/{safe_type}/"
+            f"{now:%Y%m%dT%H%M%S%fZ}.{safe_ext}"
         )
 
 
@@ -76,17 +129,19 @@ class LocalArtifactStorage(ArtifactStorage):
         attempt_step_id: str | None,
         artifact_type: str,
         payload: bytes,
-        extension: str,
+        extension: str | None = None,
+        content_type: str | None = None,
     ) -> StoredArtifact:
-        now = datetime.now(UTC)
-        tenant_segment = tenant_id or "tenant-unknown"
-        attempt_segment = attempt_id or "attempt-unknown"
-        step_segment = attempt_step_id or "step-global"
-        safe_type = artifact_type.replace("/", "-").replace(" ", "_")
-        directory = self._root / tenant_segment / attempt_segment / step_segment
-        directory.mkdir(parents=True, exist_ok=True)
-        filename = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}_{safe_type}.{extension}"
-        file_path = directory / filename
+        object_key = self.build_object_key(
+            tenant_id=tenant_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            extension=extension,
+            content_type=content_type,
+        )
+        file_path = self._root / object_key
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_bytes(payload)
 
         checksum = hashlib.sha256(payload).hexdigest()
@@ -96,18 +151,126 @@ class LocalArtifactStorage(ArtifactStorage):
             checksum=checksum,
             size_bytes=size_bytes,
             backend=self.backend_name,
+            object_key=object_key,
+            content_type=content_type,
+        )
+
+
+class S3ArtifactStorage(ArtifactStorage):
+    """S3-compatible object storage backend for durable artifact retention."""
+
+    backend_name = "s3"
+
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        region: str,
+        endpoint_url: str | None,
+        access_key_id: str,
+        secret_access_key: str,
+        session_token: str | None,
+    ) -> None:
+        self._bucket = bucket
+        self._region = region
+        self._endpoint_url = endpoint_url
+        self._access_key_id = access_key_id
+        self._secret_access_key = secret_access_key
+        self._session_token = session_token
+        self._client = None
+
+    def _get_client(self):
+        if self._client is not None:
+            return self._client
+        try:
+            import boto3
+        except Exception as exc:  # pragma: no cover - import behavior varies by env
+            raise RuntimeError("boto3_required_for_s3_artifact_storage") from exc
+        self._client = boto3.client(
+            "s3",
+            region_name=self._region,
+            endpoint_url=self._endpoint_url,
+            aws_access_key_id=self._access_key_id,
+            aws_secret_access_key=self._secret_access_key,
+            aws_session_token=self._session_token,
+        )
+        return self._client
+
+    async def store_bytes(
+        self,
+        *,
+        tenant_id: str | None,
+        attempt_id: str | None,
+        attempt_step_id: str | None,
+        artifact_type: str,
+        payload: bytes,
+        extension: str | None = None,
+        content_type: str | None = None,
+    ) -> StoredArtifact:
+        object_key = self.build_object_key(
+            tenant_id=tenant_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            extension=extension,
+            content_type=content_type,
+        )
+        checksum = hashlib.sha256(payload).hexdigest()
+        client = self._get_client()
+        put_kwargs: dict[str, Any] = {
+            "Bucket": self._bucket,
+            "Key": object_key,
+            "Body": payload,
+            "Metadata": {
+                "sha256": checksum,
+                "artifact_type": _safe_segment(artifact_type, default="artifact"),
+            },
+        }
+        if content_type:
+            put_kwargs["ContentType"] = content_type
+        client.put_object(**put_kwargs)
+
+        return StoredArtifact(
+            storage_path=f"s3://{self._bucket}/{object_key}",
+            checksum=checksum,
+            size_bytes=len(payload),
+            backend=self.backend_name,
+            object_key=object_key,
+            bucket_name=self._bucket,
+            content_type=content_type,
+        )
+
+    async def get_temporary_download_url(self, *, storage_path: str, object_key: str | None, expires_in_seconds: int) -> str:
+        key = object_key
+        if not key:
+            prefix = f"s3://{self._bucket}/"
+            if not storage_path.startswith(prefix):
+                raise ValueError("invalid_s3_storage_path")
+            key = storage_path.removeprefix(prefix)
+        client = self._get_client()
+        return str(
+            client.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={"Bucket": self._bucket, "Key": key},
+                ExpiresIn=expires_in_seconds,
+            ),
         )
 
 
 def get_artifact_storage() -> ArtifactStorage:
-    """Return configured storage backend.
-
-    Today this supports local filesystem storage. Provider wiring is additive so
-    S3/GCS backends can be introduced without changing worker orchestration.
-    """
+    """Return configured storage backend."""
 
     settings = get_settings()
-    provider = settings.artifact_storage_provider
+    provider = settings.artifact_storage_provider.lower()
     if provider == "local":
         return LocalArtifactStorage(settings.artifact_storage_local_root)
+    if provider == "s3":
+        return S3ArtifactStorage(
+            bucket=settings.artifact_storage_s3_bucket,
+            region=settings.artifact_storage_s3_region,
+            endpoint_url=settings.artifact_storage_s3_endpoint_url or None,
+            access_key_id=settings.artifact_storage_s3_access_key_id.get_secret_value(),
+            secret_access_key=settings.artifact_storage_s3_secret_access_key.get_secret_value(),
+            session_token=settings.artifact_storage_s3_session_token.get_secret_value() or None,
+        )
     raise ValueError(f"Unsupported artifact storage provider: {provider}")

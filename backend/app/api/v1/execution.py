@@ -12,6 +12,7 @@ from app.schemas.execution import (
     ExecutionAttemptResponse,
     ExecutionStepResponse,
     ProofArtifactListResponse,
+    ArtifactDownloadUrlResponse,
 )
 from app.services import execution_query as execution_service
 
@@ -100,3 +101,12 @@ async def retry_queue(
     auth: AuthContext = Depends(get_auth_context),
 ) -> ExecutionAttemptListResponse:
     return await execution_service.list_retry_queue(db, auth, page=page, page_size=page_size)
+
+
+@router.get("/artifacts/{artifact_id}/download-url", response_model=ArtifactDownloadUrlResponse)
+async def artifact_download_url(
+    artifact_id: str,
+    db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+) -> ArtifactDownloadUrlResponse:
+    return await execution_service.get_artifact_download_url(db, auth, artifact_id)
