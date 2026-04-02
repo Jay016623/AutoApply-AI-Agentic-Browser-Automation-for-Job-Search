@@ -18,7 +18,7 @@ class WorkflowRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_workflow_run_state", "current_state"),
     )
 
-    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), nullable=False)
     candidate_id: Mapped[str] = mapped_column(String(32), nullable=False)
     job_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 

@@ -18,7 +18,7 @@ class Application(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_application_tenant", "tenant_id"),
     )
 
-    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), nullable=False)
 
     # Foreign keys
     job_id: Mapped[str] = mapped_column(

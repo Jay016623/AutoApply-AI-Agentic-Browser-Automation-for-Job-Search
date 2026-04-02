@@ -15,7 +15,8 @@ from app.config.constants import API_V1_PREFIX, APP_TITLE, APP_VERSION
 from app.config.settings import Environment, get_settings
 from app.core.exceptions import AutoApplyError, RecordNotFoundError
 from app.db.redis import close_redis_pool, init_redis_pool
-from app.db.session import engine
+from app.services import tenant_hardening
+from app.db.session import async_session_factory, engine
 from app.observability.logging import configure_logging
 
 logger = structlog.get_logger(__name__)
@@ -38,6 +39,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("database_ready", managed_by="alembic_migrations")
 
     await init_redis_pool(settings.redis_url)
+
+    if settings.strict_tenant_enforcement and settings.feature_flags.strict_tenant_startup_validation:
+        async with async_session_factory() as db:
+            report = await tenant_hardening.run_safe_tenant_backfill(db)
+            null_counts = await tenant_hardening.strict_tenant_null_counts(db)
+        logger.info("tenant_backfill_report", **report.__dict__)
+        violations = {k: v for k, v in null_counts.items() if v > 0}
+        if violations:
+            raise RuntimeError(f"strict_tenant_startup_validation_failed:{violations}")
 
     yield
 

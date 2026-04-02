@@ -86,6 +86,7 @@ class FeatureFlagsSettings(BaseSettings):
     watchdog_enabled: bool = True
     manual_checkpoint_mode: bool = True
     allow_legacy_unscoped_writes: bool = False
+    strict_tenant_startup_validation: bool = True
 
 
 class AuthSettings(BaseSettings):
@@ -160,6 +161,10 @@ class Settings(BaseSettings):
         """Normalize log level to uppercase."""
         return v.upper()
 
+    @property
+    def strict_tenant_enforcement(self) -> bool:
+        """Effective strict enforcement in runtime (non-dev defaults to strict)."""
+        return self.feature_flags.tenant_enforcement or self.environment != Environment.DEVELOPMENT
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

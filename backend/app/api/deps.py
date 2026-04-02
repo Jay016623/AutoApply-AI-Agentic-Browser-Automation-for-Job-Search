@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthContext, Role
 from app.core.principal import parse_principal_token
-from app.config.settings import Environment, get_settings
+from app.config.settings import get_settings
 from app.db.redis import get_redis as _get_redis
 from app.db.session import get_db as _get_db
 from app.models.tenant_membership import TenantMembership
@@ -66,7 +66,7 @@ async def get_auth_context(
 ) -> AuthContext:
     """Resolve auth context from signed principal token with controlled legacy fallback."""
     settings = get_settings()
-    enforced = settings.feature_flags.tenant_enforcement or settings.environment != Environment.DEVELOPMENT
+    enforced = settings.strict_tenant_enforcement
 
     principal_user_id: str | None = None
     principal_tenant_id: str | None = None

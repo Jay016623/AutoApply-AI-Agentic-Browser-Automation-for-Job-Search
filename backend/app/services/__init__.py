@@ -22,8 +22,11 @@ __all__ = [
     "resume",
     "review_queue",
     "timeline_query",
+    "tenant_hardening",
 ]
 
 from . import review_queue
 
 from . import timeline_query
+
+from . import tenant_hardening

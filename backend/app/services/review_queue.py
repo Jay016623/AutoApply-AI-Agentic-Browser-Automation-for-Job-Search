@@ -30,6 +30,8 @@ _ALLOWED_REASONS = {
 async def create_review_task(db: AsyncSession, payload: ReviewTaskCreate) -> ReviewTask:
     if payload.reason not in _ALLOWED_REASONS:
         raise ValueError("unsupported_review_reason")
+    if not payload.tenant_id:
+        raise ValueError("tenant_id_required_for_review_task")
 
     existing = (
         await db.execute(

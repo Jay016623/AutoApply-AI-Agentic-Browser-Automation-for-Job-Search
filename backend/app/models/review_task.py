@@ -19,7 +19,7 @@ class ReviewTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_review_task_reason", "reason"),
     )
 
-    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), nullable=False)
     application_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("applications.id", ondelete="SET NULL"), nullable=True)
     workflow_run_id: Mapped[str] = mapped_column(String(32), ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False)
     attempt_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("application_attempts.id", ondelete="SET NULL"), nullable=True)

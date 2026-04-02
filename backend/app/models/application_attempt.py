@@ -19,7 +19,7 @@ class ApplicationAttempt(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_attempt_status", "status"),
     )
 
-    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), nullable=False)
     application_id: Mapped[str] = mapped_column(
         String(32),
         ForeignKey("applications.id", ondelete="CASCADE"),

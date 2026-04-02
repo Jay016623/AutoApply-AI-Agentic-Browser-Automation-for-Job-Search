@@ -9,7 +9,7 @@ class ReviewTaskResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    tenant_id: str | None = None
+    tenant_id: str
     application_id: str | None = None
     workflow_run_id: str
     attempt_id: str | None = None
@@ -40,7 +40,7 @@ class ReviewActionRequest(BaseModel):
 
 
 class ReviewTaskCreate(BaseModel):
-    tenant_id: str | None = None
+    tenant_id: str
     application_id: str | None = None
     workflow_run_id: str
     attempt_id: str | None = None

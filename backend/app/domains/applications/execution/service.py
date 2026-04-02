@@ -34,7 +34,7 @@ class ApplicationAttemptService:
     async def create_or_get_attempt(
         self,
         *,
-        tenant_id: str | None,
+        tenant_id: str,
         application_id: str,
         workflow_run_id: str | None,
         candidate_id: str | None,
@@ -275,7 +275,7 @@ class ApplicationAttemptService:
     async def create_proof_artifact(
         self,
         *,
-        tenant_id: str | None,
+        tenant_id: str,
         application_id: str | None,
         workflow_run_id: str | None,
         attempt_id: str | None,
@@ -322,7 +322,7 @@ class ApplicationAttemptService:
     async def store_structured_artifact(
         self,
         *,
-        tenant_id: str | None,
+        tenant_id: str,
         application_id: str | None,
         workflow_run_id: str | None,
         attempt_id: str | None,
@@ -366,7 +366,7 @@ class ApplicationAttemptService:
     async def store_file_artifact(
         self,
         *,
-        tenant_id: str | None,
+        tenant_id: str,
         application_id: str | None,
         workflow_run_id: str | None,
         attempt_id: str | None,

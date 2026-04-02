@@ -18,7 +18,7 @@ class ProofArtifact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_proof_backend", "storage_backend"),
     )
 
-    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), nullable=False)
 
     application_id: Mapped[str | None] = mapped_column(
         String(32),
