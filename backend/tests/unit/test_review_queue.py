@@ -1,5 +1,8 @@
 """Unit tests for review queue manual actions."""
 
+import pytest
+from fastapi import HTTPException
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -61,3 +64,35 @@ class TestReviewQueue:
         assert updated.status == "resolved"
         refreshed = (await db_session.execute(select(ReviewTask).where(ReviewTask.id == task.id))).scalar_one()
         assert refreshed.resolution_action == "retry"
+
+
+    async def test_invalid_action_and_role_enforcement(self, db_session: AsyncSession, sample_job_data: dict):
+        app, run_id = await _create_app_and_workflow(db_session, sample_job_data)
+        task = await review_queue.create_review_task(
+            db_session,
+            ReviewTaskCreate(
+                tenant_id="tenant-1",
+                application_id=app.id,
+                workflow_run_id=run_id,
+                reason="unsupported_ui",
+                idempotency_key=f"{app.id}:review:unsupported",
+            ),
+        )
+
+        with pytest.raises(ValueError):
+            await review_queue.apply_review_action(
+                db_session,
+                AuthContext(user_id="reviewer-1", tenant_id="tenant-1", role=Role.REVIEWER, enforced=True),
+                task_id=task.id,
+                action="invalid_action",
+                notes=None,
+            )
+
+        with pytest.raises(HTTPException):
+            await review_queue.apply_review_action(
+                db_session,
+                AuthContext(user_id="readonly-1", tenant_id="tenant-1", role=Role.READ_ONLY, enforced=True),
+                task_id=task.id,
+                action="approve",
+                notes="should fail",
+            )
