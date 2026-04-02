@@ -1,6 +1,6 @@
-"""Operational admin endpoints for Phase 1 foundations."""
+"""Operational admin endpoints for health, diagnostics, and session bootstrap."""
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,11 +12,15 @@ from app.config.settings import get_settings
 from app.db.redis import is_redis_available
 from app.models.tenant_membership import TenantMembership
 from app.schemas.admin import (
+    DependencyStatusResponse,
+    OpsDiagnosticsResponse,
     QueueDepthResponse,
+    ReadinessResponse,
     SessionBootstrapRequest,
     SessionBootstrapResponse,
     SystemHealthResponse,
 )
+from app.services import ops_diagnostics
 from app.services.queue import get_queue_depth
 
 router = APIRouter()
@@ -35,6 +39,44 @@ async def system_health(
         redis="ok" if redis_ok else "degraded",
         workflow_v2_enabled=settings.feature_flags.workflow_v2_enabled,
         tenant_enforcement=settings.feature_flags.tenant_enforcement,
+    )
+
+
+@router.get("/ready", response_model=ReadinessResponse, summary="Readiness checks")
+async def readiness(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+    auth: AuthContext = Depends(get_auth_context),
+) -> ReadinessResponse:
+    """Run dependency readiness checks for API, DB, Redis, queues, and artifacts."""
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.OPERATOR, Role.READ_ONLY})
+    database = await ops_diagnostics.check_database(db)
+    redis_status = await ops_diagnostics.check_redis(redis)
+    artifact = await ops_diagnostics.check_artifact_backend()
+    queues = await ops_diagnostics.queue_depth_snapshot(redis)
+    overall_ok = all(item.status == "ok" for item in (database, redis_status, artifact))
+    if not overall_ok:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return ReadinessResponse(
+        status="ok" if overall_ok else "degraded",
+        api="ok",
+        database=DependencyStatusResponse(
+            status=database.status,
+            latency_ms=database.latency_ms,
+            details=database.details or None,
+        ),
+        redis=DependencyStatusResponse(
+            status=redis_status.status,
+            latency_ms=redis_status.latency_ms,
+            details=redis_status.details or None,
+        ),
+        artifact_storage=DependencyStatusResponse(
+            status=artifact.status,
+            latency_ms=artifact.latency_ms,
+            details=artifact.details or None,
+        ),
+        queues=queues,
     )
 
 
@@ -58,6 +100,23 @@ async def queue_depths(
         apply_dead_letter=apply_dead_letter_depth,
         scrape=scrape_depth,
         generate=generate_depth,
+    )
+
+
+@router.get("/diagnostics", response_model=OpsDiagnosticsResponse, summary="Operations diagnostics")
+async def diagnostics(
+    db: AsyncSession = Depends(get_db),
+    redis=Depends(get_redis),
+    auth: AuthContext = Depends(get_auth_context),
+) -> OpsDiagnosticsResponse:
+    """Return queue and workflow pressure diagnostics for incident response."""
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.OPERATOR, Role.READ_ONLY})
+    settings = get_settings()
+    return OpsDiagnosticsResponse(
+        queue_depths=await ops_diagnostics.queue_depth_snapshot(redis),
+        workflow_pressure=await ops_diagnostics.workflow_pressure_snapshot(db),
+        tenant_enforcement=settings.strict_tenant_enforcement,
+        strict_startup_validation=settings.feature_flags.strict_tenant_startup_validation,
     )
 
 

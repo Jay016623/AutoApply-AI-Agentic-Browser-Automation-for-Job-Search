@@ -9,6 +9,7 @@ import structlog
 from redis.asyncio import Redis
 
 from app.config.constants import QUEUE_APPLY, QUEUE_APPLY_DEAD_LETTER
+from app.observability.metrics import retry_events_total
 from app.services.queue import dead_letter, enqueue_envelope, normalize_envelope
 
 logger = structlog.get_logger(__name__)
@@ -39,6 +40,13 @@ async def process_apply_message(
     trace_id = envelope.get("trace_id")
     retry_count = int(envelope.get("retry_count", 0) or 0)
     max_retries = int(envelope.get("max_retries", 3) or 3)
+    logger.info(
+        "worker.message_received",
+        trace_id=trace_id,
+        tenant_id=envelope.get("tenant_id"),
+        retry_count=retry_count,
+        max_retries=max_retries,
+    )
 
     try:
         _validate_envelope(envelope)
@@ -50,6 +58,7 @@ async def process_apply_message(
             reason="invalid_envelope",
             error=str(exc),
         )
+        retry_events_total.labels(event_type="runtime_validation", status="dead_lettered").inc()
         return
 
     payload = envelope["payload"]
@@ -74,6 +83,7 @@ async def process_apply_message(
                 reason="retries_exhausted",
                 error=str(exc),
             )
+            retry_events_total.labels(event_type="runtime_retry", status="dead_lettered").inc()
             return
 
         retry_envelope = {
@@ -82,6 +92,7 @@ async def process_apply_message(
             "last_error": str(exc),
         }
         await enqueue_envelope(redis, QUEUE_APPLY, retry_envelope)
+        retry_events_total.labels(event_type="runtime_retry", status="requeued").inc()
         logger.warning(
             "worker.message_requeued",
             trace_id=trace_id,

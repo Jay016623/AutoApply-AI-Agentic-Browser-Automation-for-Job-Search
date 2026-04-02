@@ -31,6 +31,7 @@ from app.domains.applications.workflow import WorkflowService, WorkflowState
 from app.models.application import Application
 from app.models.job import Job
 from app.models.resume import Resume
+from app.observability.metrics import automation_runs_total
 from app.schemas.resume import ResumeGenerateRequest
 from app.schemas.review import ReviewTaskCreate
 from app.services import resume as resume_service, review_queue
@@ -799,6 +800,7 @@ async def process_application(payload: dict[str, Any]) -> None:
                 resume_path=resume_path or "",
             )
             if not applied:
+                automation_runs_total.labels(platform=platform_name, outcome="failure").inc()
                 if payload.get("manual_checkpoint_mode") or not submit_retryable:
                     await _update_application_status(
                         app_id,
@@ -850,6 +852,7 @@ async def process_application(payload: dict[str, Any]) -> None:
                 return
         except KeyError as exc:
             error_msg = f"Platform creation failed: {exc}"
+            automation_runs_total.labels(platform=platform_name, outcome="failure").inc()
             logger.error("worker.platform_create_failed", error=str(exc))
             await _update_application_status(app_id, ApplicationStatus.FAILED, notes=error_msg)
             await _broadcast_progress(app_id, ApplicationStatus.FAILED, detail=error_msg)
@@ -863,6 +866,7 @@ async def process_application(payload: dict[str, Any]) -> None:
             return
         except Exception as exc:
             error_msg = f"Application submission failed: {exc}"
+            automation_runs_total.labels(platform=platform_name, outcome="failure").inc()
             logger.error("worker.submit_failed", app_id=app_id, platform=platform_name, error=str(exc))
             await _update_application_status(
                 app_id,
@@ -896,6 +900,7 @@ async def process_application(payload: dict[str, Any]) -> None:
             idempotency_key=f"{app_id}:submitted",
             step_name="submit_application",
         )
+        automation_runs_total.labels(platform=platform_name, outcome="success").inc()
         logger.info(
             "worker.completed",
             job_id=job_id,

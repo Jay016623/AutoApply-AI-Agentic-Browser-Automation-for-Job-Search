@@ -12,6 +12,21 @@ class SystemHealthResponse(BaseModel):
     tenant_enforcement: bool
 
 
+class DependencyStatusResponse(BaseModel):
+    status: str
+    latency_ms: float
+    details: str | None = None
+
+
+class ReadinessResponse(BaseModel):
+    status: str
+    api: str
+    database: DependencyStatusResponse
+    redis: DependencyStatusResponse
+    artifact_storage: DependencyStatusResponse
+    queues: dict[str, int]
+
+
 class QueueDepthResponse(BaseModel):
     """Queue depths for worker operations."""
 
@@ -19,6 +34,13 @@ class QueueDepthResponse(BaseModel):
     apply_dead_letter: int = 0
     scrape: int
     generate: int
+
+
+class OpsDiagnosticsResponse(BaseModel):
+    queue_depths: dict[str, int]
+    workflow_pressure: dict[str, int]
+    tenant_enforcement: bool
+    strict_startup_validation: bool
 
 
 class SessionBootstrapRequest(BaseModel):

@@ -11,6 +11,7 @@ from app.core.exceptions import RecordNotFoundError
 from app.domains.applications.workflow import WorkflowService, WorkflowState
 from app.models.application import Application
 from app.models.review_task import ReviewTask
+from app.observability.metrics import review_queue_open, review_queue_total
 from app.schemas.review import ReviewTaskCreate, ReviewTaskListResponse, ReviewTaskResponse
 from app.services.audit import AuditLogCreate, record_audit_log
 
@@ -25,6 +26,11 @@ _ALLOWED_REASONS = {
     "duplicate_risk",
     "unsupported_ui",
 }
+
+
+async def _refresh_review_queue_open_metric(db: AsyncSession) -> None:
+    open_count = int((await db.execute(select(func.count(ReviewTask.id)).where(ReviewTask.status == "open"))).scalar() or 0)
+    review_queue_open.labels(tenant_scope="global").set(open_count)
 
 
 async def create_review_task(db: AsyncSession, payload: ReviewTaskCreate) -> ReviewTask:
@@ -58,6 +64,8 @@ async def create_review_task(db: AsyncSession, payload: ReviewTaskCreate) -> Rev
     db.add(task)
     await db.commit()
     await db.refresh(task)
+    review_queue_total.labels(event_type="created", reason=task.reason, status=task.status).inc()
+    await _refresh_review_queue_open_metric(db)
     await record_audit_log(
         db,
         AuditLogCreate(
@@ -108,6 +116,7 @@ async def list_review_tasks(
 
     rows = list((await db.execute(query.order_by(ReviewTask.created_at.desc()).offset(offset).limit(page_size))).scalars().all())
     total = int((await db.execute(count_query)).scalar() or 0)
+    await _refresh_review_queue_open_metric(db)
     return ReviewTaskListResponse(
         items=[ReviewTaskResponse.model_validate(row) for row in rows],
         total=total,
@@ -186,6 +195,8 @@ async def apply_review_action(
 
     await db.commit()
     await db.refresh(task)
+    review_queue_total.labels(event_type="action", reason=task.reason, status=task.status).inc()
+    await _refresh_review_queue_open_metric(db)
 
     await record_audit_log(
         db,

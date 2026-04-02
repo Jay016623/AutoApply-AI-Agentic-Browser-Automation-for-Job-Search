@@ -2,12 +2,14 @@
 
 from datetime import UTC, datetime
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import RecordNotFoundError
 from app.models.workflow_run import WorkflowRun
 from app.models.workflow_step import WorkflowStep
+from app.observability.metrics import workflow_transitions_total
 from app.services.audit import AuditLogCreate, record_audit_log
 
 from .retry_policy import RetryDecision, evaluate_retry
@@ -23,6 +25,7 @@ class WorkflowService:
 
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
+        self._logger = structlog.get_logger(__name__)
 
     async def create_run(
         self,
@@ -44,6 +47,14 @@ class WorkflowService:
         self._db.add(run)
         await self._db.commit()
         await self._db.refresh(run)
+        self._logger.info(
+            "workflow_run_created",
+            run_id=run.id,
+            tenant_id=run.tenant_id,
+            candidate_id=run.candidate_id,
+            job_id=run.job_id,
+            max_retries=run.max_retries,
+        )
         return run
 
     async def get_run(self, run_id: str, tenant_id: str | None = None) -> WorkflowRun:
@@ -78,6 +89,14 @@ class WorkflowService:
         current = WorkflowState(run.current_state)
         validation = transition(current, target_state)
         if not validation.allowed:
+            self._logger.warning(
+                "workflow_transition_rejected",
+                run_id=run_id,
+                from_state=current.value,
+                to_state=target_state.value,
+                reason=validation.reason,
+                step_name=step_name,
+            )
             raise WorkflowTransitionError(
                 f"Cannot transition from {current} to {target_state}: {validation.reason}",
             )
@@ -109,6 +128,21 @@ class WorkflowService:
 
         await self._db.commit()
         await self._db.refresh(run)
+        workflow_transitions_total.labels(
+            to_state=target_state.value,
+            step_name=step_name,
+            status=run.status,
+        ).inc()
+        self._logger.info(
+            "workflow_transition_completed",
+            run_id=run.id,
+            tenant_id=run.tenant_id,
+            from_state=current.value,
+            to_state=target_state.value,
+            step_name=step_name,
+            retry_count=run.retry_count,
+            status=run.status,
+        )
 
         await record_audit_log(
             self._db,

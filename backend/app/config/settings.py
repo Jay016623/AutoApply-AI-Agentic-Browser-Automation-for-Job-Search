@@ -3,7 +3,7 @@
 from enum import StrEnum
 from functools import lru_cache
 
-from pydantic import SecretStr, field_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -165,6 +165,25 @@ class Settings(BaseSettings):
     def strict_tenant_enforcement(self) -> bool:
         """Effective strict enforcement in runtime (non-dev defaults to strict)."""
         return self.feature_flags.tenant_enforcement or self.environment != Environment.DEVELOPMENT
+
+    @model_validator(mode="after")
+    def validate_production_safety(self) -> "Settings":
+        """Fail fast on broken high-risk production/staging configs."""
+        if self.environment in {Environment.STAGING, Environment.PRODUCTION}:
+            if self.auth.token_secret.get_secret_value() in {"", "dev-insecure-change-me"}:
+                raise ValueError("AUTH__TOKEN_SECRET must be set to a non-default value in staging/production")
+            if self.redis_url.strip() == "":
+                raise ValueError("REDIS_URL must be configured in staging/production")
+            if self.database_url.strip() == "":
+                raise ValueError("DATABASE_URL must be configured in staging/production")
+            provider = self.artifact_storage_provider.lower().strip()
+            if provider == "s3" and (
+                not self.artifact_storage_s3_bucket.strip()
+                or not self.artifact_storage_s3_access_key_id.get_secret_value().strip()
+                or not self.artifact_storage_s3_secret_access_key.get_secret_value().strip()
+            ):
+                raise ValueError("S3 artifact storage requires bucket/access key/secret key in staging/production")
+        return self
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

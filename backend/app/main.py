@@ -14,10 +14,11 @@ from app.api.websocket.endpoint import router as ws_router
 from app.config.constants import API_V1_PREFIX, APP_TITLE, APP_VERSION
 from app.config.settings import Environment, get_settings
 from app.core.exceptions import AutoApplyError, RecordNotFoundError
-from app.db.redis import close_redis_pool, init_redis_pool
+from app.db.redis import close_redis_pool, get_redis, init_redis_pool
 from app.services import tenant_hardening
 from app.db.session import async_session_factory, engine
 from app.observability.logging import configure_logging
+from app.services import ops_diagnostics
 
 logger = structlog.get_logger(__name__)
 settings = get_settings()
@@ -118,6 +119,30 @@ def create_app() -> FastAPI:
     async def health_check() -> dict[str, str]:
         """Health check endpoint."""
         return {"status": "ok", "version": APP_VERSION}
+
+    @app.get("/healthz")
+    async def liveness_probe() -> dict[str, str]:
+        """Liveness probe for orchestrators."""
+        return {"status": "alive"}
+
+    @app.get("/readyz")
+    async def readiness_probe() -> dict:
+        """Readiness probe for critical runtime dependencies."""
+        async with async_session_factory() as db:
+            database = await ops_diagnostics.check_database(db)
+        redis = get_redis()
+        redis_status = await ops_diagnostics.check_redis(redis)
+        artifact = await ops_diagnostics.check_artifact_backend()
+        overall_ok = all(item.status == "ok" for item in (database, redis_status, artifact))
+        payload = {
+            "status": "ok" if overall_ok else "degraded",
+            "database": database.status,
+            "redis": redis_status.status,
+            "artifact_storage": artifact.status,
+        }
+        if not overall_ok:
+            return JSONResponse(status_code=503, content=payload)
+        return payload
 
     return app
 

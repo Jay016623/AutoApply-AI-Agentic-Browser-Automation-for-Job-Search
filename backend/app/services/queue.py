@@ -12,6 +12,8 @@ from typing import Any
 import structlog
 from redis.asyncio import Redis
 
+from app.observability.metrics import queue_dead_letter_total, queue_depth
+
 logger = structlog.get_logger(__name__)
 
 
@@ -77,6 +79,7 @@ async def enqueue(
         "enqueued_at": datetime.now(UTC).isoformat(),
     }
     await redis.rpush(queue_name, json.dumps(message))
+    queue_depth.labels(queue_name=queue_name).inc()
     logger.info("task_enqueued", task_id=task_id, queue=queue_name)
     return task_id
 
@@ -90,6 +93,7 @@ async def enqueue_envelope(redis: Redis, queue_name: str, envelope: dict[str, An
         "enqueued_at": datetime.now(UTC).isoformat(),
     }
     await redis.rpush(queue_name, json.dumps(message))
+    queue_depth.labels(queue_name=queue_name).inc()
     logger.info(
         "task_enqueued",
         task_id=task_id,
@@ -122,6 +126,7 @@ async def dequeue(
 
     _queue, raw = result
     message = json.loads(raw)
+    queue_depth.labels(queue_name=queue_name).dec()
     logger.debug("task_dequeued", task_id=message.get("task_id"), queue=queue_name)
     return message
 
@@ -136,7 +141,9 @@ async def get_queue_depth(redis: Redis, queue_name: str) -> int:
     Returns:
         Number of items currently in the queue.
     """
-    return await redis.llen(queue_name)
+    depth = await redis.llen(queue_name)
+    queue_depth.labels(queue_name=queue_name).set(depth)
+    return depth
 
 
 async def dead_letter(
@@ -156,6 +163,8 @@ async def dead_letter(
     }
     event_id = uuid.uuid4().hex
     await redis.rpush(dead_letter_queue, json.dumps(dead_letter_event))
+    queue_dead_letter_total.labels(queue_name=dead_letter_queue, reason=reason).inc()
+    queue_depth.labels(queue_name=dead_letter_queue).inc()
     logger.error(
         "task_dead_lettered",
         event_id=event_id,

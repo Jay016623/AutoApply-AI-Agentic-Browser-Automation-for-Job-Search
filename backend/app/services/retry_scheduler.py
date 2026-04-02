@@ -15,6 +15,7 @@ from app.domains.applications.workflow.retry_policy import exponential_backoff_d
 from app.models.application import Application
 from app.models.application_attempt import ApplicationAttempt
 from app.models.job import Job
+from app.observability.metrics import retry_events_total
 from app.services.queue import build_envelope, enqueue_envelope
 
 logger = structlog.get_logger(__name__)
@@ -31,6 +32,7 @@ async def run_retry_cycle(redis: Redis, max_retries: int = MAX_RETRIES, batch_si
     acquired = await redis.set(SCHEDULER_LOCK_KEY, lock_token, ex=SCHEDULER_LOCK_TTL_SECONDS, nx=True)
     if not acquired:
         logger.debug("retry_scheduler.lock_not_acquired")
+        retry_events_total.labels(event_type="lock_skip", status="not_acquired").inc()
         return {"scheduled": 0, "dispatched": 0, "manual_escalated": 0}
 
     now = datetime.now(UTC)
@@ -61,8 +63,10 @@ async def run_retry_cycle(redis: Redis, max_retries: int = MAX_RETRIES, batch_si
                     )
                     if updated.status == "waiting_manual":
                         manual_escalated += 1
+                        retry_events_total.labels(event_type="retry_schedule", status="manual_escalated").inc()
                     else:
                         scheduled += 1
+                        retry_events_total.labels(event_type="retry_schedule", status="scheduled").inc()
                     continue
 
                 if attempt.status == "retry_scheduled" and attempt.next_retry_at and attempt.next_retry_at <= now:
@@ -74,6 +78,7 @@ async def run_retry_cycle(redis: Redis, max_retries: int = MAX_RETRIES, batch_si
                             max_retries=0,
                         )
                         manual_escalated += 1
+                        retry_events_total.labels(event_type="retry_dispatch", status="manual_escalated").inc()
                         continue
 
                     payload["execution_idempotency_key"] = attempt.id
@@ -88,6 +93,7 @@ async def run_retry_cycle(redis: Redis, max_retries: int = MAX_RETRIES, batch_si
                     await enqueue_envelope(redis, QUEUE_APPLY, envelope)
                     await service.mark_retry_dispatched(attempt.id)
                     dispatched += 1
+                    retry_events_total.labels(event_type="retry_dispatch", status="dispatched").inc()
     finally:
         current_token = await redis.get(SCHEDULER_LOCK_KEY)
         if current_token is not None and current_token.decode("utf-8") == lock_token:
@@ -98,6 +104,8 @@ async def run_retry_cycle(redis: Redis, max_retries: int = MAX_RETRIES, batch_si
         scheduled=scheduled,
         dispatched=dispatched,
         manual_escalated=manual_escalated,
+        max_retries=max_retries,
+        batch_size=batch_size,
     )
     return {
         "scheduled": scheduled,

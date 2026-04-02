@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config.settings import get_settings
+from app.observability.metrics import artifact_storage_bytes_total
 
 _SAFE_SEGMENT_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
 
@@ -89,6 +90,10 @@ class ArtifactStorage:
 
         return storage_path
 
+    async def check_health(self) -> tuple[bool, str]:
+        """Validate backend is writable/reachable for readiness checks."""
+        return True, "ok"
+
     def build_object_key(
         self,
         *,
@@ -121,6 +126,16 @@ class LocalArtifactStorage(ArtifactStorage):
         self._root = Path(root_dir)
         self._root.mkdir(parents=True, exist_ok=True)
 
+    async def check_health(self) -> tuple[bool, str]:
+        try:
+            self._root.mkdir(parents=True, exist_ok=True)
+            probe = self._root / ".healthcheck"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return True, "ok"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"local_storage_unavailable:{exc}"
+
     async def store_bytes(
         self,
         *,
@@ -146,7 +161,7 @@ class LocalArtifactStorage(ArtifactStorage):
 
         checksum = hashlib.sha256(payload).hexdigest()
         size_bytes = len(payload)
-        return StoredArtifact(
+        stored = StoredArtifact(
             storage_path=file_path.as_posix(),
             checksum=checksum,
             size_bytes=size_bytes,
@@ -154,6 +169,8 @@ class LocalArtifactStorage(ArtifactStorage):
             object_key=object_key,
             content_type=content_type,
         )
+        artifact_storage_bytes_total.labels(backend=self.backend_name, artifact_type=artifact_type).inc(stored.size_bytes)
+        return stored
 
 
 class S3ArtifactStorage(ArtifactStorage):
@@ -230,7 +247,7 @@ class S3ArtifactStorage(ArtifactStorage):
             put_kwargs["ContentType"] = content_type
         client.put_object(**put_kwargs)
 
-        return StoredArtifact(
+        stored = StoredArtifact(
             storage_path=f"s3://{self._bucket}/{object_key}",
             checksum=checksum,
             size_bytes=len(payload),
@@ -239,6 +256,8 @@ class S3ArtifactStorage(ArtifactStorage):
             bucket_name=self._bucket,
             content_type=content_type,
         )
+        artifact_storage_bytes_total.labels(backend=self.backend_name, artifact_type=artifact_type).inc(stored.size_bytes)
+        return stored
 
     async def get_temporary_download_url(self, *, storage_path: str, object_key: str | None, expires_in_seconds: int) -> str:
         key = object_key
@@ -255,6 +274,14 @@ class S3ArtifactStorage(ArtifactStorage):
                 ExpiresIn=expires_in_seconds,
             ),
         )
+
+    async def check_health(self) -> tuple[bool, str]:
+        try:
+            client = self._get_client()
+            client.head_bucket(Bucket=self._bucket)
+            return True, "ok"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"s3_unreachable:{exc}"
 
 
 def get_artifact_storage() -> ArtifactStorage:
