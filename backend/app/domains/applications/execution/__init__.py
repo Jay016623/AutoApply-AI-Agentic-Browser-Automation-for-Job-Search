@@ -5,6 +5,7 @@ from .adapters import (
     ExecutionContext,
     PlatformApplyAdapter,
 )
+from .risk_router import RiskDecision, RiskSignals, apply_policy, score_risk
 from .service import ApplicationAttemptService
 
 __all__ = [
@@ -12,4 +13,8 @@ __all__ = [
     "ApplicationAttemptService",
     "ExecutionContext",
     "PlatformApplyAdapter",
+    "RiskDecision",
+    "RiskSignals",
+    "apply_policy",
+    "score_risk",
 ]

@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -38,6 +38,9 @@ class ApplicationAttempt(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False)
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    risk_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    confidence_score: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    risk_level: Mapped[str] = mapped_column(String(20), nullable=False, default="low_risk")
 
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

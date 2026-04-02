@@ -19,6 +19,13 @@ _REVIEW_ROLES = {Role.OWNER, Role.ADMIN, Role.OPERATOR, Role.REVIEWER}
 _ALLOWED_ACTIONS = {"approve", "reject", "retry", "mark_manual_complete", "abandon"}
 _ALLOWED_REASONS = {
     "low_confidence_match",
+    "missing_required_fields",
+    "ambiguous_form_state",
+    "captcha_detected",
+    "selector_drift",
+    "unknown_ui_pattern",
+    "duplicate_application_risk",
+    # Backward-compatible legacy reasons
     "risky_tailoring",
     "incomplete_answers",
     "captcha_or_auth_block",

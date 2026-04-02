@@ -288,6 +288,46 @@ class ApplicationAttemptService:
         )
         return attempt
 
+    async def record_risk_evaluation(
+        self,
+        attempt_id: str,
+        *,
+        risk_score: float,
+        confidence_score: float,
+        risk_level: str,
+        stage: str,
+        route_to_review: bool,
+        reason: str | None,
+    ) -> ApplicationAttempt:
+        attempt = await self._get_attempt(attempt_id)
+        attempt.risk_score = risk_score
+        attempt.confidence_score = confidence_score
+        attempt.risk_level = risk_level
+        await self._db.commit()
+        await self._db.refresh(attempt)
+
+        await self._audit(
+            attempt,
+            "risk_evaluated",
+            message=f"stage={stage} risk_level={risk_level}",
+            metadata={
+                "stage": stage,
+                "risk_score": risk_score,
+                "confidence_score": confidence_score,
+                "risk_level": risk_level,
+                "route_to_review": route_to_review,
+                "reason": reason,
+            },
+        )
+        if route_to_review:
+            await self._audit(
+                attempt,
+                "routed_to_review",
+                message=f"stage={stage} reason={reason or 'policy'}",
+                metadata={"stage": stage, "reason": reason, "risk_level": risk_level},
+            )
+        return attempt
+
     async def create_proof_artifact(
         self,
         *,

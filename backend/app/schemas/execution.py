@@ -18,6 +18,9 @@ class ExecutionAttemptResponse(BaseModel):
     current_step: str | None = None
     attempt_number: int
     retry_count: int
+    risk_score: float
+    confidence_score: float
+    risk_level: str
     started_at: datetime | None = None
     completed_at: datetime | None = None
     last_error_code: str | None = None

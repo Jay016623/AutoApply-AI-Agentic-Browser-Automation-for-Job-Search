@@ -26,10 +26,14 @@ from app.domains.applications.execution import (
     ApplicationAttemptService,
     ExecutionContext,
     PlatformApplyAdapter,
+    RiskSignals,
+    apply_policy,
+    score_risk,
 )
 from app.domains.applications.workflow import WorkflowService, WorkflowState
 from app.models.application import Application
 from app.models.job import Job
+from app.models.tenant import Tenant
 from app.models.resume import Resume
 from app.observability.metrics import automation_runs_total
 from app.schemas.resume import ResumeGenerateRequest
@@ -47,16 +51,18 @@ def _map_failure_category_to_review_reason(category: str | None, manual_reason: 
     category = (category or "").lower()
     reason = (manual_reason or "").lower()
     if "incomplete" in reason or "missing" in reason:
-        return "incomplete_answers"
+        return "missing_required_fields"
     if category in {"auth_expired", "captcha"}:
-        return "captcha_or_auth_block"
-    if category in {"unsupported_ui"}:
-        return "unsupported_ui"
+        return "captcha_detected"
+    if category in {"unsupported_ui", "unknown"}:
+        return "unknown_ui_pattern"
+    if category in {"selector_drift"}:
+        return "selector_drift"
     if category in {"duplicate_application"}:
-        return "duplicate_risk"
-    if category in {"unknown", "selector_drift", "timeout", "upload_failed"}:
-        return "uncertain_submission"
-    return "uncertain_submission"
+        return "duplicate_application_risk"
+    if category in {"timeout", "upload_failed"}:
+        return "ambiguous_form_state"
+    return "ambiguous_form_state"
 
 
 async def _create_review_task(
@@ -158,7 +164,10 @@ async def _execute_attempt_path(
     tenant_id = payload.get("tenant_id") or job.tenant_id
     candidate_id = payload.get("candidate_id")
     manual_reason = payload.get("manual_checkpoint_reason")
+    manual_override = bool(payload.get("manual_checkpoint_mode"))
+    job_match_confidence = float(payload.get("ats_score") or 0.75)
     execution_key = payload.get("execution_idempotency_key") or f"{app_id}:{workflow_run_id or 'none'}:v1"
+    medium_risk_requires_review = await _medium_risk_requires_review(tenant_id)
 
     async with async_session_factory() as db:
         attempt_service = ApplicationAttemptService(db, tenant_scope=tenant_id)
@@ -251,6 +260,56 @@ async def _execute_attempt_path(
                     verification_hints=payload.get("verification_evidence", {}) or {},
                 )
                 prepared_context = await adapter.prepare(exec_context)
+                before_submit_flags: set[str] = set()
+                if job_match_confidence < 0.55:
+                    before_submit_flags.add("low_confidence_match")
+                if resume_path == "":
+                    before_submit_flags.add("missing_required_fields")
+                before_submit_scored = score_risk(
+                    RiskSignals(
+                        job_match_confidence=job_match_confidence,
+                        document_tailoring_confidence=0.8 if resume_path else 0.5,
+                        submission_verification_confidence=0.6,
+                        flags=before_submit_flags,
+                    ),
+                )
+                before_submit_decision = apply_policy(
+                    scored=before_submit_scored,
+                    medium_risk_requires_review=medium_risk_requires_review,
+                    manual_override=manual_override,
+                )
+                await attempt_service.record_risk_evaluation(
+                    attempt.id,
+                    risk_score=before_submit_decision.risk_score,
+                    confidence_score=before_submit_decision.confidence_score,
+                    risk_level=before_submit_decision.risk_level,
+                    stage="before_submission",
+                    route_to_review=before_submit_decision.route_to_review,
+                    reason=before_submit_decision.reason,
+                )
+                if before_submit_decision.route_to_review:
+                    route_reason = before_submit_decision.reason or "ambiguous_form_state"
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="RISK_POLICY_ROUTE",
+                        error_message=f"Routed to review before submission ({route_reason})",
+                        retryable=False,
+                        manual_checkpoint_reason=f"risk_policy:{route_reason}",
+                    )
+                    await _create_review_task(
+                        tenant_id=job.tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        reason=route_reason,
+                        details={
+                            "stage": "before_submission",
+                            "risk_score": before_submit_decision.risk_score,
+                            "confidence_score": before_submit_decision.confidence_score,
+                            "risk_level": before_submit_decision.risk_level,
+                        },
+                        idempotency_key=f"{app_id}:review:risk:before_submission",
+                    )
+                    return False, "Routed to review by risk policy before submission", False, route_reason
                 await attempt_service.store_structured_artifact(
                     tenant_id=tenant_id,
                     application_id=app_id,
@@ -268,6 +327,64 @@ async def _execute_attempt_path(
                     metadata_json={"category": "request_payload"},
                 )
                 adapter_result = await adapter.execute(prepared_context)
+                post_fill_flags: set[str] = set()
+                if adapter_result.failure_category is not None:
+                    category = adapter_result.failure_category.value
+                    if category == "captcha":
+                        post_fill_flags.add("captcha_detected")
+                    elif category == "selector_drift":
+                        post_fill_flags.add("selector_drift")
+                    elif category == "unsupported_ui":
+                        post_fill_flags.add("unknown_ui_pattern")
+                    elif category == "duplicate_application":
+                        post_fill_flags.add("duplicate_application_risk")
+                    else:
+                        post_fill_flags.add("ambiguous_form_state")
+                post_fill_scored = score_risk(
+                    RiskSignals(
+                        job_match_confidence=job_match_confidence,
+                        document_tailoring_confidence=0.8 if resume_path else 0.5,
+                        submission_verification_confidence=0.55 if adapter_result.success else 0.3,
+                        flags=post_fill_flags,
+                    ),
+                )
+                post_fill_decision = apply_policy(
+                    scored=post_fill_scored,
+                    medium_risk_requires_review=medium_risk_requires_review,
+                    manual_override=manual_override,
+                )
+                await attempt_service.record_risk_evaluation(
+                    attempt.id,
+                    risk_score=post_fill_decision.risk_score,
+                    confidence_score=post_fill_decision.confidence_score,
+                    risk_level=post_fill_decision.risk_level,
+                    stage="after_form_fill",
+                    route_to_review=post_fill_decision.route_to_review,
+                    reason=post_fill_decision.reason,
+                )
+                if post_fill_decision.route_to_review:
+                    route_reason = post_fill_decision.reason or "ambiguous_form_state"
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="RISK_POLICY_ROUTE",
+                        error_message=f"Routed to review after form fill ({route_reason})",
+                        retryable=False,
+                        manual_checkpoint_reason=f"risk_policy:{route_reason}",
+                    )
+                    await _create_review_task(
+                        tenant_id=job.tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        reason=route_reason,
+                        details={
+                            "stage": "after_form_fill",
+                            "risk_score": post_fill_decision.risk_score,
+                            "confidence_score": post_fill_decision.confidence_score,
+                            "risk_level": post_fill_decision.risk_level,
+                        },
+                        idempotency_key=f"{app_id}:review:risk:after_form_fill",
+                    )
+                    return False, "Routed to review by risk policy after form fill", False, route_reason
                 await attempt_service.store_structured_artifact(
                     tenant_id=tenant_id,
                     application_id=app_id,
@@ -323,6 +440,67 @@ async def _execute_attempt_path(
                     )
                     return False, "Adapter result missing before verification", False, "unsupported_ui"
                 verification_result = adapter.verify(adapter_result)
+                verification_flags: set[str] = set()
+                if not verification_result.verified:
+                    if verification_result.failure_category is not None:
+                        category = verification_result.failure_category.value
+                        if category == "captcha":
+                            verification_flags.add("captcha_detected")
+                        elif category == "selector_drift":
+                            verification_flags.add("selector_drift")
+                        elif category == "duplicate_application":
+                            verification_flags.add("duplicate_application_risk")
+                        elif category == "unsupported_ui":
+                            verification_flags.add("unknown_ui_pattern")
+                        else:
+                            verification_flags.add("ambiguous_form_state")
+                    else:
+                        verification_flags.add("ambiguous_form_state")
+                verification_scored = score_risk(
+                    RiskSignals(
+                        job_match_confidence=job_match_confidence,
+                        document_tailoring_confidence=0.8 if resume_path else 0.5,
+                        submission_verification_confidence=0.9 if verification_result.verified else 0.2,
+                        flags=verification_flags,
+                    ),
+                )
+                verification_decision = apply_policy(
+                    scored=verification_scored,
+                    medium_risk_requires_review=medium_risk_requires_review,
+                    manual_override=manual_override,
+                )
+                await attempt_service.record_risk_evaluation(
+                    attempt.id,
+                    risk_score=verification_decision.risk_score,
+                    confidence_score=verification_decision.confidence_score,
+                    risk_level=verification_decision.risk_level,
+                    stage="after_verification",
+                    route_to_review=verification_decision.route_to_review,
+                    reason=verification_decision.reason,
+                )
+                if verification_decision.route_to_review:
+                    route_reason = verification_decision.reason or "ambiguous_form_state"
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="RISK_POLICY_ROUTE",
+                        error_message=f"Routed to review after verification ({route_reason})",
+                        retryable=False,
+                        manual_checkpoint_reason=f"risk_policy:{route_reason}",
+                    )
+                    await _create_review_task(
+                        tenant_id=job.tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        reason=route_reason,
+                        details={
+                            "stage": "after_verification",
+                            "risk_score": verification_decision.risk_score,
+                            "confidence_score": verification_decision.confidence_score,
+                            "risk_level": verification_decision.risk_level,
+                        },
+                        idempotency_key=f"{app_id}:review:risk:after_verification",
+                    )
+                    return False, "Routed to review by risk policy after verification", False, route_reason
                 if not verification_result.verified:
                     await attempt_service.record_step_failed(
                         step_id=step.id,
@@ -849,6 +1027,7 @@ async def process_application(payload: dict[str, Any]) -> None:
                 step_name="submit_application",
             )
         try:
+            payload["ats_score"] = ats_score
             applied, submit_error, submit_retryable, submit_failure_category = await _execute_attempt_path(
                 payload=payload,
                 app_id=app_id,
@@ -1054,3 +1233,12 @@ async def run_worker() -> None:
 
 if __name__ == "__main__":
     asyncio.run(run_worker())
+async def _medium_risk_requires_review(tenant_id: str | None) -> bool:
+    if not tenant_id:
+        return True
+    async with async_session_factory() as db:
+        tenant = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one_or_none()
+        if tenant is None or not isinstance(tenant.feature_overrides, dict):
+            return True
+        value = tenant.feature_overrides.get("medium_risk_requires_review")
+        return bool(value) if value is not None else True
