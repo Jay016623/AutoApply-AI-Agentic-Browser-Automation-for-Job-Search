@@ -9,15 +9,19 @@ from typing import Any
 import litellm
 import structlog
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import get_settings
 from app.core.exceptions import LLMProviderError, LLMRateLimitError, LLMTimeoutError
+from app.db.session import async_session_factory
+from app.models.llm_usage import LLMUsage
 from app.observability.metrics import (
     llm_cost_usd,
     llm_latency_seconds,
     llm_requests_total,
     llm_tokens_total,
 )
+from app.services import control_plane
 
 logger = structlog.get_logger(__name__)
 
@@ -45,11 +49,40 @@ class LLMClient:
     metrics recording for every call.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tenant_id: str | None = None) -> None:
         settings = get_settings()
         self._llm = settings.llm
+        self._tenant_id = tenant_id
         self._configure_portkey()
         self._configure_api_keys()
+
+    async def _enforce_tenant_llm_quota(self, db: AsyncSession, estimated_tokens: int) -> None:
+        if not self._tenant_id:
+            return
+        await control_plane.enforce_quota(
+            db,
+            tenant_id=self._tenant_id,
+            quota_key="llm_daily_tokens",
+            increment=float(max(estimated_tokens, 1)),
+            context={"operation": "llm_complete", "stage": "pre_request"},
+        )
+
+    async def _record_tenant_llm_usage(self, db: AsyncSession, *, response: LLMResponse, purpose: str) -> None:
+        if not self._tenant_id:
+            return
+        row = LLMUsage(
+            tenant_id=self._tenant_id,
+            provider=response.provider,
+            model=response.model,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+            total_tokens=response.total_tokens,
+            cost_usd=response.cost_usd,
+            latency_ms=int(response.latency_ms),
+            purpose=purpose,
+        )
+        db.add(row)
+        await db.commit()
 
     def _configure_portkey(self) -> None:
         """Configure Portkey gateway headers if API key is available."""
@@ -144,6 +177,8 @@ class LLMClient:
             provider = attempt_model.split("/")[0] if "/" in attempt_model else "openai"
             start = time.perf_counter()
             try:
+                async with async_session_factory() as db:
+                    await self._enforce_tenant_llm_quota(db, estimated_tokens=tokens)
                 kwargs: dict[str, Any] = {
                     "model": attempt_model,
                     "messages": messages,
@@ -181,7 +216,7 @@ class LLMClient:
                     cost_usd=round(cost, 6),
                     latency_ms=round(elapsed_ms, 1),
                 )
-                return LLMResponse(
+                llm_response = LLMResponse(
                     content=content,
                     model=attempt_model,
                     provider=provider,
@@ -191,6 +226,17 @@ class LLMClient:
                     cost_usd=cost,
                     latency_ms=elapsed_ms,
                 )
+                if self._tenant_id:
+                    async with async_session_factory() as db:
+                        await control_plane.enforce_quota(
+                            db,
+                            tenant_id=self._tenant_id,
+                            quota_key="llm_daily_cost_usd",
+                            increment=float(max(cost, 0.0)),
+                            context={"operation": "llm_complete", "stage": "post_response", "purpose": purpose},
+                        )
+                        await self._record_tenant_llm_usage(db, response=llm_response, purpose=purpose)
+                return llm_response
 
             except litellm.RateLimitError as exc:
                 last_error = exc

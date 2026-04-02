@@ -20,6 +20,17 @@ from app.schemas.job import (
     JobListResponse,
     JobSearchRequest,
 )
+from app.schemas.candidate import (
+    CandidateCreate,
+    CandidateListResponse,
+    CandidateProfileSnapshotCreate,
+    CandidateProfileSnapshotResponse,
+    CandidateResponse,
+    CandidateSettingsSchema,
+    CandidateUpdate,
+    CoverLetterVersionResponse,
+    ResumeVersionResponse,
+)
 from app.schemas.resume import (
     ResumeGenerateRequest,
     ResumeListResponse,
@@ -29,6 +40,17 @@ from app.schemas.resume import (
     ResumeUploadResponse,
 )
 from app.schemas.settings import LLMProviderStatus, SettingsResponse, SettingsUpdate
+from app.schemas.review import ReviewActionRequest, ReviewTaskListResponse, ReviewTaskResponse
+from app.schemas.execution import (
+    ArtifactDownloadUrlResponse,
+    ExecutionAttemptListResponse,
+    ExecutionAttemptResponse,
+    ExecutionStepResponse,
+    ProofArtifactListResponse,
+    ProofArtifactResponse,
+    TimelineEventResponse,
+    TimelineResponse,
+)
 
 __all__ = [
     "ATSScoreDistribution",
@@ -41,6 +63,23 @@ __all__ = [
     "ApplicationResponse",
     "ApplicationStatusUpdate",
     "DashboardStats",
+    "ProofArtifactResponse",
+    "ProofArtifactListResponse",
+    "ExecutionStepResponse",
+    "ExecutionAttemptResponse",
+    "ExecutionAttemptListResponse",
+    "ArtifactDownloadUrlResponse",
+    "TimelineResponse",
+    "TimelineEventResponse",
+    # candidate
+    "CandidateCreate",
+    "CandidateListResponse",
+    "CandidateProfileSnapshotCreate",
+    "CandidateProfileSnapshotResponse",
+    "CandidateResponse",
+    "CandidateSettingsSchema",
+    "CandidateUpdate",
+    "CoverLetterVersionResponse",
     # job
     "JobAnalysisResponse",
     "JobListResponse",
@@ -56,7 +95,11 @@ __all__ = [
     "ResumeScoreRequest",
     "ResumeScoreResponse",
     "ResumeUploadResponse",
+    "ResumeVersionResponse",
     "SettingsResponse",
     "SettingsUpdate",
     "TimelineEntry",
+    "ReviewTaskResponse",
+    "ReviewActionRequest",
+    "ReviewTaskListResponse",
 ]

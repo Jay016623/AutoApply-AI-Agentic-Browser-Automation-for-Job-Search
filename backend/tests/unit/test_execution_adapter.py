@@ -1,0 +1,154 @@
+"""Unit tests for deterministic execution adapter wrapper."""
+
+from unittest.mock import AsyncMock, patch
+
+from app.core.automation.platforms.base import JobListing
+from app.domains.applications.execution.adapters import (
+    AdapterFailureClass,
+    ExecutionContext,
+    FailureCategory,
+    PlatformApplyAdapter,
+)
+
+
+def _context(platform: str = "linkedin", manual_mode: bool = False) -> ExecutionContext:
+    return ExecutionContext(
+        tenant_id="tenant-1",
+        application_id="app-1",
+        workflow_run_id="wf-1",
+        attempt_id="attempt-1",
+        platform_name=platform,
+        job_listing=JobListing(
+            platform=platform,
+            platform_job_id="ext-1",
+            title="Engineer",
+            company="TestCo",
+            location="Remote",
+            url="https://example.com/job",
+            description="desc",
+            job_type="full-time",
+            remote=True,
+        ),
+        resume_path="/tmp/resume.pdf",
+        manual_checkpoint_mode=manual_mode,
+        manual_checkpoint_reason="operator requested" if manual_mode else None,
+        verification_hints={},
+    )
+
+
+class TestPlatformApplyAdapter:
+    async def test_manual_checkpoint_mode_returns_manual_classification(self):
+        adapter = PlatformApplyAdapter()
+
+        result = await adapter.execute(_context(manual_mode=True))
+
+        assert result.success is False
+        assert adapter.classify_failure(result) == AdapterFailureClass.MANUAL_CHECKPOINT
+
+    async def test_unsupported_platform_returns_manual_checkpoint(self):
+        adapter = PlatformApplyAdapter()
+        with patch("app.domains.applications.execution.adapters.platform_apply.platform_registry") as mock_registry:
+            mock_registry.has.return_value = False
+            result = await adapter.execute(_context(platform="monster"))
+
+        assert result.unsupported is True
+        assert result.needs_manual_checkpoint is True
+        assert adapter.classify_failure(result) == AdapterFailureClass.UNSUPPORTED
+
+    async def test_platform_apply_false_is_retryable(self):
+        adapter = PlatformApplyAdapter()
+        mock_platform = AsyncMock()
+        mock_platform.apply = AsyncMock(return_value=False)
+
+        with patch("app.domains.applications.execution.adapters.platform_apply.platform_registry") as mock_registry:
+            mock_registry.has.return_value = True
+            mock_registry.create.return_value = mock_platform
+            result = await adapter.execute(_context())
+
+        assert result.success is False
+        assert result.error_code.startswith("PLATFORM_APPLY_FAILED_")
+        assert result.failure_category == FailureCategory.UNKNOWN
+        assert adapter.classify_failure(result) == AdapterFailureClass.RETRYABLE
+
+    async def test_success_with_strong_evidence_is_confirmed(self):
+        adapter = PlatformApplyAdapter()
+        mock_platform = AsyncMock()
+        mock_platform.apply = AsyncMock(
+            return_value={
+                "submitted": True,
+                "current_url": "https://www.linkedin.com/jobs/application-complete",
+                "page_text": "Your application has been submitted",
+                "dom_markers": ["submission-confirmation"],
+                "submission_id": "ABC-123",
+            },
+        )
+
+        with patch("app.domains.applications.execution.adapters.platform_apply.platform_registry") as mock_registry:
+            mock_registry.has.return_value = True
+            mock_registry.create.return_value = mock_platform
+            result = await adapter.execute(_context())
+
+        verification = adapter.verify(result)
+        artifacts = adapter.collect_artifacts(result)
+
+        assert result.success is True
+        assert verification.verified is True
+        assert verification.classification == "confirmed_success"
+        assert len(artifacts) >= 1
+        assert adapter.classify_failure(result) == AdapterFailureClass.NONE
+
+    async def test_success_without_evidence_is_uncertain_manual_checkpoint(self):
+        adapter = PlatformApplyAdapter()
+        mock_platform = AsyncMock()
+        mock_platform.apply = AsyncMock(return_value=True)
+
+        with patch("app.domains.applications.execution.adapters.platform_apply.platform_registry") as mock_registry:
+            mock_registry.has.return_value = True
+            mock_registry.create.return_value = mock_platform
+            result = await adapter.execute(_context())
+
+        verification = adapter.verify(result)
+        assert verification.verified is False
+        assert verification.classification == "uncertain"
+        assert verification.requires_manual_checkpoint is True
+        assert verification.confidence_score < 0.75
+
+    async def test_failure_markers_are_retryable_failed(self):
+        adapter = PlatformApplyAdapter()
+        mock_platform = AsyncMock()
+        mock_platform.apply = AsyncMock(
+            return_value={
+                "submitted": True,
+                "current_url": "https://www.indeed.com/apply",
+                "page_text": "There was an error submitting your application. Please try again.",
+                "dom_markers": ["error-banner"],
+            },
+        )
+
+        with patch("app.domains.applications.execution.adapters.platform_apply.platform_registry") as mock_registry:
+            mock_registry.has.return_value = True
+            mock_registry.create.return_value = mock_platform
+            result = await adapter.execute(_context(platform="indeed"))
+
+        verification = adapter.verify(result)
+        assert verification.verified is False
+        assert verification.classification == "failed"
+        assert verification.retryable is True
+
+    async def test_captcha_failure_routes_to_manual(self):
+        adapter = PlatformApplyAdapter()
+        mock_platform = AsyncMock()
+        mock_platform.apply = AsyncMock(
+            return_value={
+                "submitted": False,
+                "error_message": "Captcha required before submission",
+            },
+        )
+
+        with patch("app.domains.applications.execution.adapters.platform_apply.platform_registry") as mock_registry:
+            mock_registry.has.return_value = True
+            mock_registry.create.return_value = mock_platform
+            result = await adapter.execute(_context(platform="linkedin"))
+
+        assert result.failure_category == FailureCategory.CAPTCHA
+        assert adapter.classify_failure(result) == AdapterFailureClass.MANUAL_CHECKPOINT

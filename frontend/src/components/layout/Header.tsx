@@ -13,6 +13,8 @@ import { DRAWER_WIDTH } from './Sidebar';
 function Header() {
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
   const wsConnected = useAppStore((s) => s.wsConnected);
+  const tenantId = useAppStore((s) => s.authTenantId);
+  const role = useAppStore((s) => s.authRole);
 
   return (
     <AppBar
@@ -42,6 +44,18 @@ function Header() {
         </Typography>
 
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Chip
+            label={tenantId ?? 'no-tenant'}
+            variant="outlined"
+            size="small"
+            sx={{ fontWeight: 500 }}
+          />
+          <Chip
+            label={`role:${role ?? 'none'}`}
+            variant="outlined"
+            size="small"
+            sx={{ fontWeight: 500, textTransform: 'capitalize' }}
+          />
           <Chip
             icon={
               <CircleIcon

@@ -9,6 +9,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config.constants import ApplicationStatus
+from app.domains.applications.workflow import WorkflowState
 from app.workers.application_worker import process_application
 
 # ---------------------------------------------------------------------------
@@ -90,6 +91,21 @@ class TestProcessApplicationHappyPath:
                 "app.workers.application_worker._update_application_status",
                 new_callable=AsyncMock,
             ),
+            patch(
+                "app.workers.application_worker._ensure_workflow_run",
+                new_callable=AsyncMock,
+                return_value=("wf-1", WorkflowState.DISCOVERED),
+            ),
+            patch(
+                "app.workers.application_worker._transition_workflow_state",
+                new_callable=AsyncMock,
+                side_effect=lambda *_args, **_kwargs: _args[1],
+            ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
+            ),
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
@@ -140,6 +156,21 @@ class TestProcessApplicationHappyPath:
                 "app.workers.application_worker._update_application_status",
                 new_callable=AsyncMock,
             ),
+            patch(
+                "app.workers.application_worker._ensure_workflow_run",
+                new_callable=AsyncMock,
+                return_value=("wf-1", WorkflowState.DISCOVERED),
+            ),
+            patch(
+                "app.workers.application_worker._transition_workflow_state",
+                new_callable=AsyncMock,
+                side_effect=lambda *_args, **_kwargs: _args[1],
+            ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
+            ),
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
@@ -175,6 +206,21 @@ class TestProcessApplicationErrors:
                 "app.workers.application_worker._update_application_status",
                 new_callable=AsyncMock,
             ),
+            patch(
+                "app.workers.application_worker._ensure_workflow_run",
+                new_callable=AsyncMock,
+                return_value=("wf-1", WorkflowState.DISCOVERED),
+            ),
+            patch(
+                "app.workers.application_worker._transition_workflow_state",
+                new_callable=AsyncMock,
+                side_effect=lambda *_args, **_kwargs: _args[1],
+            ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
+            ),
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = False
@@ -200,6 +246,21 @@ class TestProcessApplicationErrors:
             patch(
                 "app.workers.application_worker._update_application_status",
                 new_callable=AsyncMock,
+            ),
+            patch(
+                "app.workers.application_worker._ensure_workflow_run",
+                new_callable=AsyncMock,
+                return_value=("wf-1", WorkflowState.DISCOVERED),
+            ),
+            patch(
+                "app.workers.application_worker._transition_workflow_state",
+                new_callable=AsyncMock,
+                side_effect=lambda *_args, **_kwargs: _args[1],
+            ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
             ),
         ):
             mock_ws.broadcast = AsyncMock()
@@ -237,6 +298,21 @@ class TestProcessApplicationErrors:
             patch(
                 "app.workers.application_worker._update_application_status",
                 new_callable=AsyncMock,
+            ),
+            patch(
+                "app.workers.application_worker._ensure_workflow_run",
+                new_callable=AsyncMock,
+                return_value=("wf-1", WorkflowState.DISCOVERED),
+            ),
+            patch(
+                "app.workers.application_worker._transition_workflow_state",
+                new_callable=AsyncMock,
+                side_effect=lambda *_args, **_kwargs: _args[1],
+            ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
             ),
         ):
             mock_ws.broadcast = AsyncMock()
@@ -278,6 +354,21 @@ class TestProcessApplicationErrors:
                 "app.workers.application_worker._update_application_status",
                 new_callable=AsyncMock,
             ),
+            patch(
+                "app.workers.application_worker._ensure_workflow_run",
+                new_callable=AsyncMock,
+                return_value=("wf-1", WorkflowState.DISCOVERED),
+            ),
+            patch(
+                "app.workers.application_worker._transition_workflow_state",
+                new_callable=AsyncMock,
+                side_effect=lambda *_args, **_kwargs: _args[1],
+            ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
+            ),
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
@@ -315,6 +406,21 @@ class TestProcessApplicationErrors:
             patch(
                 "app.workers.application_worker._update_application_status",
                 new_callable=AsyncMock,
+            ),
+            patch(
+                "app.workers.application_worker._ensure_workflow_run",
+                new_callable=AsyncMock,
+                return_value=("wf-1", WorkflowState.DISCOVERED),
+            ),
+            patch(
+                "app.workers.application_worker._transition_workflow_state",
+                new_callable=AsyncMock,
+                side_effect=lambda *_args, **_kwargs: _args[1],
+            ),
+            patch(
+                "app.workers.application_worker._execute_attempt_path",
+                new_callable=AsyncMock,
+                return_value=(True, None),
             ),
         ):
             mock_ws.broadcast = AsyncMock()

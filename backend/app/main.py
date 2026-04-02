@@ -14,10 +14,11 @@ from app.api.websocket.endpoint import router as ws_router
 from app.config.constants import API_V1_PREFIX, APP_TITLE, APP_VERSION
 from app.config.settings import Environment, get_settings
 from app.core.exceptions import AutoApplyError, RecordNotFoundError
-from app.db.redis import close_redis_pool, init_redis_pool
-from app.db.session import engine
-from app.models import Base
+from app.db.redis import close_redis_pool, get_redis, init_redis_pool
+from app.services import tenant_hardening
+from app.db.session import async_session_factory, engine
 from app.observability.logging import configure_logging
+from app.services import ops_diagnostics
 
 logger = structlog.get_logger(__name__)
 settings = get_settings()
@@ -34,12 +35,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         environment=settings.environment.value,
     )
 
-    # Create database tables (safe no-op if they already exist)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("database_ready")
+    if settings.auto_create_schema_on_startup:
+        logger.warning("database_auto_create_enabled", warning="use_migrations_instead")
+    logger.info("database_ready", managed_by="alembic_migrations")
 
     await init_redis_pool(settings.redis_url)
+
+    if settings.strict_tenant_enforcement and settings.feature_flags.strict_tenant_startup_validation:
+        async with async_session_factory() as db:
+            report = await tenant_hardening.run_safe_tenant_backfill(db)
+            null_counts = await tenant_hardening.strict_tenant_null_counts(db)
+        logger.info("tenant_backfill_report", **report.__dict__)
+        violations = {k: v for k, v in null_counts.items() if v > 0}
+        if violations:
+            raise RuntimeError(f"strict_tenant_startup_validation_failed:{violations}")
 
     yield
 
@@ -110,6 +119,30 @@ def create_app() -> FastAPI:
     async def health_check() -> dict[str, str]:
         """Health check endpoint."""
         return {"status": "ok", "version": APP_VERSION}
+
+    @app.get("/healthz")
+    async def liveness_probe() -> dict[str, str]:
+        """Liveness probe for orchestrators."""
+        return {"status": "alive"}
+
+    @app.get("/readyz")
+    async def readiness_probe() -> dict:
+        """Readiness probe for critical runtime dependencies."""
+        async with async_session_factory() as db:
+            database = await ops_diagnostics.check_database(db)
+        redis = get_redis()
+        redis_status = await ops_diagnostics.check_redis(redis)
+        artifact = await ops_diagnostics.check_artifact_backend()
+        overall_ok = all(item.status == "ok" for item in (database, redis_status, artifact))
+        payload = {
+            "status": "ok" if overall_ok else "degraded",
+            "database": database.status,
+            "redis": redis_status.status,
+            "artifact_storage": artifact.status,
+        }
+        if not overall_ok:
+            return JSONResponse(status_code=503, content=payload)
+        return payload
 
     return app
 

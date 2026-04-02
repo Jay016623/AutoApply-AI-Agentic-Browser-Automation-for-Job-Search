@@ -15,10 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.documents.generator import DocumentGenerator
 from app.core.documents.parser import DocumentParser, ParsedResume
+from app.core.auth import AuthContext, ensure_tenant_access, require_tenant
 from app.core.exceptions import ParseError, RecordNotFoundError
 from app.core.llm.client import LLMClient
+from app.config.settings import get_settings
 from app.models.job import Job
 from app.models.resume import Resume
+from app.models.resume_version import ResumeVersion
 from app.schemas.resume import (
     ResumeGenerateRequest,
     ResumeListResponse,
@@ -85,6 +88,8 @@ def _extract_skills(text: str) -> list[str]:
 async def upload_resume(
     db: AsyncSession,
     file: UploadFile,
+    candidate_id: str | None = None,
+    auth: AuthContext | None = None,
 ) -> ResumeUploadResponse:
     """Upload, parse, and store a resume file.
 
@@ -136,16 +141,27 @@ async def upload_resume(
         skills_detected = _extract_skills(parsed_text)
 
     resume = Resume(
+        tenant_id=(require_tenant(auth) if auth and auth.enforced else (auth.tenant_id if auth else None)),
         name=file.filename or "Untitled Resume",
         type="base",
+        candidate_id=candidate_id,
         template_id="modern",
         file_path_pdf=str(dest) if file_ext == ".pdf" else None,
         file_path_docx=str(dest) if file_ext == ".docx" else None,
         content_text=parsed_text[:5000],
     )
+    if resume.tenant_id is None and not get_settings().feature_flags.allow_legacy_unscoped_writes:
+        raise PermissionError("tenant_id_required_for_resume_upload")
     db.add(resume)
     await db.commit()
     await db.refresh(resume)
+    await _create_resume_version(
+        db=db,
+        resume=resume,
+        candidate_id=candidate_id,
+        variant_type="base",
+        label=resume.name,
+    )
 
     logger.info("resume_uploaded", resume_id=resume.id, filename=file.filename)
 
@@ -158,7 +174,7 @@ async def upload_resume(
     )
 
 
-async def list_resumes(db: AsyncSession) -> ResumeListResponse:
+async def list_resumes(db: AsyncSession, auth: AuthContext | None = None) -> ResumeListResponse:
     """List all resumes.
 
     Args:
@@ -167,18 +183,30 @@ async def list_resumes(db: AsyncSession) -> ResumeListResponse:
     Returns:
         List of all resumes with total count.
     """
-    result = await db.execute(select(Resume).order_by(Resume.created_at.desc()))
+    query = select(Resume)
+    if auth and auth.enforced:
+        query = query.where(Resume.tenant_id == require_tenant(auth))
+    elif auth and auth.tenant_id:
+        query = query.where(Resume.tenant_id == auth.tenant_id)
+    result = await db.execute(query.order_by(Resume.created_at.desc()))
     resumes = list(result.scalars().all())
     items = [ResumeResponse.model_validate(r) for r in resumes]
     return ResumeListResponse(items=items, total=len(items))
 
 
-async def get_resume(db: AsyncSession, resume_id: str) -> Resume:
+async def get_resume(db: AsyncSession, resume_id: str, auth: AuthContext | None = None) -> Resume:
     """Get a resume by ID or raise RecordNotFoundError."""
-    result = await db.execute(select(Resume).where(Resume.id == resume_id))
+    query = select(Resume).where(Resume.id == resume_id)
+    if auth and auth.enforced:
+        query = query.where(Resume.tenant_id == require_tenant(auth))
+    elif auth and auth.tenant_id:
+        query = query.where(Resume.tenant_id == auth.tenant_id)
+    result = await db.execute(query)
     resume = result.scalar_one_or_none()
     if resume is None:
         raise RecordNotFoundError("Resume", resume_id)
+    if auth:
+        ensure_tenant_access(auth, resume.tenant_id)
     return resume
 
 
@@ -322,6 +350,9 @@ def _parse_education_section(text: str) -> list[dict]:
 async def generate_tailored_resume(
     db: AsyncSession,
     request: ResumeGenerateRequest,
+    auth: AuthContext | None = None,
+    allow_system: bool = False,
+    system_tenant_id: str | None = None,
 ) -> ResumeResponse:
     """Generate a tailored resume for a specific job using LLM.
 
@@ -335,14 +366,20 @@ async def generate_tailored_resume(
     Returns:
         The generated tailored resume response.
     """
-    base = await get_resume(db, request.base_resume_id)
+    if auth is None and not allow_system:
+        raise PermissionError("auth_context_required_for_resume_generation")
+    base = await get_resume(db, request.base_resume_id, auth=auth)
     job = await _get_job(db, request.job_id)
+    if auth is not None:
+        ensure_tenant_access(auth, job.tenant_id)
+    elif system_tenant_id and job.tenant_id and system_tenant_id != job.tenant_id:
+        raise PermissionError("system_tenant_mismatch_for_job")
 
     # Build structured data from base resume text
     resume_data = _build_resume_data_from_text(base.content_text or "")
 
     # Generate via DocumentGenerator (LLM tailoring + rendering)
-    llm = LLMClient()
+    llm = LLMClient(tenant_id=base.tenant_id)
     generator = DocumentGenerator(llm_client=llm)
     doc = await generator.generate_resume(
         resume_data=resume_data,
@@ -358,6 +395,8 @@ async def generate_tailored_resume(
         template_id=request.template_id,
         base_resume_id=request.base_resume_id,
         job_id=request.job_id,
+        tenant_id=base.tenant_id,
+        candidate_id=request.candidate_id or base.candidate_id,
         file_path_pdf=doc.pdf_path,
         file_path_docx=doc.docx_path,
         content_text=base.content_text,
@@ -365,6 +404,13 @@ async def generate_tailored_resume(
     db.add(tailored)
     await db.commit()
     await db.refresh(tailored)
+    await _create_resume_version(
+        db=db,
+        resume=tailored,
+        candidate_id=tailored.candidate_id,
+        variant_type="tailored",
+        label=tailored.name,
+    )
 
     logger.info(
         "tailored_resume_generated",
@@ -377,10 +423,49 @@ async def generate_tailored_resume(
     return ResumeResponse.model_validate(tailored)
 
 
+async def _create_resume_version(
+    db: AsyncSession,
+    resume: Resume,
+    candidate_id: str | None,
+    variant_type: str,
+    label: str,
+) -> None:
+    """Persist version metadata for candidate-linked resume artifacts."""
+    if not candidate_id:
+        return
+
+    result = await db.execute(
+        select(ResumeVersion)
+        .where(ResumeVersion.candidate_id == candidate_id)
+        .order_by(ResumeVersion.version.desc())
+        .limit(1),
+    )
+    latest = result.scalar_one_or_none()
+    next_version = (latest.version + 1) if latest is not None else 1
+
+    version = ResumeVersion(
+        tenant_id=resume.tenant_id,
+        candidate_id=candidate_id,
+        resume_id=resume.id,
+        job_id=resume.job_id,
+        version=next_version,
+        label=label,
+        template_id=resume.template_id,
+        variant_type=variant_type,
+        file_path_pdf=resume.file_path_pdf,
+        file_path_docx=resume.file_path_docx,
+        content_text=resume.content_text,
+        ats_score=resume.ats_score,
+    )
+    db.add(version)
+    await db.commit()
+
+
 async def score_resume(
     db: AsyncSession,
     resume_id: str,
     request: ResumeScoreRequest,
+    auth: AuthContext | None = None,
 ) -> ResumeScoreResponse:
     """Score a resume against a job listing using multi-factor ATS analysis.
 
@@ -396,7 +481,7 @@ async def score_resume(
     Returns:
         Detailed ATS score breakdown.
     """
-    resume = await get_resume(db, resume_id)
+    resume = await get_resume(db, resume_id, auth=auth)
     job = await _get_job(db, request.job_id)
 
     resume_text = resume.content_text or ""
@@ -542,6 +627,7 @@ async def optimize_resume(
     db: AsyncSession,
     resume_id: str,
     job_id: str | None = None,
+    auth: AuthContext | None = None,
 ) -> ResumeResponse:
     """Optimize a resume for ATS compatibility using LLM rewriting.
 
@@ -557,18 +643,21 @@ async def optimize_resume(
     Returns:
         The newly created optimized resume.
     """
-    resume = await get_resume(db, resume_id)
+    if auth is None:
+        raise PermissionError("auth_context_required_for_resume_optimization")
+    resume = await get_resume(db, resume_id, auth=auth)
     target_job_id = job_id or resume.job_id
     if not target_job_id:
         raise RecordNotFoundError("Job", "none (no job_id provided)")
 
     job = await _get_job(db, target_job_id)
+    ensure_tenant_access(auth, job.tenant_id)
     resume_text = resume.content_text or ""
     job_description = job.description or ""
 
     # Score the resume to get detailed breakdown
     score_result = await score_resume(
-        db, resume_id, ResumeScoreRequest(job_id=target_job_id),
+        db, resume_id, ResumeScoreRequest(job_id=target_job_id), auth=auth,
     )
 
     # Get optimizer suggestions
@@ -610,7 +699,7 @@ async def optimize_resume(
     )
     from app.core.llm.prompts.resume_tailor import TailoredResumeData
 
-    llm = LLMClient()
+    llm = LLMClient(tenant_id=resume.tenant_id)
     prompt = render_ats_optimize_prompt(
         resume_text, job_description, score_breakdown, suggestions,
     )
@@ -637,6 +726,8 @@ async def optimize_resume(
         template_id=resume.template_id,
         base_resume_id=resume_id,
         job_id=target_job_id,
+        tenant_id=resume.tenant_id,
+        candidate_id=resume.candidate_id,
         file_path_pdf=doc.pdf_path,
         file_path_docx=doc.docx_path,
         content_text=resume_text,
@@ -662,5 +753,12 @@ async def optimize_resume(
         optimized_id=optimized.id,
         original_score=score_result.overall_score,
         new_score=optimized.ats_score,
+    )
+    await _create_resume_version(
+        db=db,
+        resume=optimized,
+        candidate_id=optimized.candidate_id,
+        variant_type="optimized",
+        label=optimized.name,
     )
     return ResumeResponse.model_validate(optimized)

@@ -11,6 +11,7 @@ APP_TITLE = "AutoApply AI"
 QUEUE_APPLY = "autoapply:queue:apply"
 QUEUE_SCRAPE = "autoapply:queue:scrape"
 QUEUE_GENERATE = "autoapply:queue:generate"
+QUEUE_APPLY_DEAD_LETTER = "autoapply:queue:apply:dead_letter"
 
 # FAISS index names
 INDEX_JOBS = "job_embeddings"

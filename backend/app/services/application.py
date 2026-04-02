@@ -6,12 +6,17 @@ Handles creating, listing, approving, and updating job applications.
 from datetime import UTC, datetime
 
 import structlog
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, ApplicationStatus
+from app.config.settings import get_settings
+from app.core.auth import AuthContext, Role, ensure_role, ensure_tenant_access, require_tenant
 from app.core.exceptions import RecordNotFoundError
 from app.models.application import Application
+from app.models.job import Job
+from app.services import control_plane
 from app.schemas.application import (
     ApplicationBatchCreate,
     ApplicationCreate,
@@ -26,6 +31,7 @@ logger = structlog.get_logger(__name__)
 async def create_application(
     db: AsyncSession,
     data: ApplicationCreate,
+    auth: AuthContext,
 ) -> Application:
     """Create a single job application.
 
@@ -36,7 +42,33 @@ async def create_application(
     Returns:
         The newly created Application.
     """
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+    tenant_id = require_tenant(auth) if auth.enforced else (auth.tenant_id or data.tenant_id)
+    if tenant_id is None and not get_settings().feature_flags.allow_legacy_unscoped_writes:
+        raise ValueError("tenant_id_required_for_application_create")
+    job_result = await db.execute(select(Job).where(Job.id == data.job_id))
+    job = job_result.scalar_one_or_none()
+    if job is None:
+        raise RecordNotFoundError("Job", data.job_id)
+    if tenant_id and job.tenant_id and job.tenant_id != tenant_id:
+        raise ValueError("application_job_tenant_mismatch")
+    if auth.enforced and job.tenant_id != tenant_id:
+        raise ValueError("application_job_tenant_mismatch")
+    if tenant_id:
+        try:
+            await control_plane.enforce_quota(
+                db,
+                tenant_id=tenant_id,
+                quota_key="daily_applications",
+                increment=1,
+                actor_id=auth.user_id,
+                actor_type="user",
+                context={"operation": "create_application", "job_id": data.job_id},
+            )
+        except control_plane.QuotaExceededError as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
     application = Application(
+        tenant_id=tenant_id,
         job_id=data.job_id,
         resume_id=data.resume_id,
         apply_mode=data.apply_mode,
@@ -52,6 +84,7 @@ async def create_application(
 async def create_batch(
     db: AsyncSession,
     data: ApplicationBatchCreate,
+    auth: AuthContext,
 ) -> list[Application]:
     """Create multiple applications at once.
 
@@ -62,9 +95,35 @@ async def create_batch(
     Returns:
         List of newly created Applications.
     """
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+    tenant_id = require_tenant(auth) if auth.enforced else auth.tenant_id
+    if tenant_id is None and not get_settings().feature_flags.allow_legacy_unscoped_writes:
+        raise ValueError("tenant_id_required_for_batch_create")
     applications: list[Application] = []
+    if tenant_id:
+        try:
+            await control_plane.enforce_quota(
+                db,
+                tenant_id=tenant_id,
+                quota_key="daily_applications",
+                increment=float(len(data.job_ids)),
+                actor_id=auth.user_id,
+                actor_type="user",
+                context={"operation": "create_batch", "job_count": len(data.job_ids)},
+            )
+        except control_plane.QuotaExceededError as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
     for job_id in data.job_ids:
+        job_result = await db.execute(select(Job).where(Job.id == job_id))
+        job = job_result.scalar_one_or_none()
+        if job is None:
+            raise RecordNotFoundError("Job", job_id)
+        if tenant_id and job.tenant_id and job.tenant_id != tenant_id:
+            raise ValueError("application_job_tenant_mismatch")
+        if auth.enforced and job.tenant_id != tenant_id:
+            raise ValueError("application_job_tenant_mismatch")
         app = Application(
+            tenant_id=tenant_id,
             job_id=job_id,
             resume_id=data.resume_id,
             apply_mode=data.apply_mode,
@@ -83,6 +142,7 @@ async def create_batch(
 
 async def list_applications(
     db: AsyncSession,
+    auth: AuthContext,
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
     status: str | None = None,
@@ -103,6 +163,14 @@ async def list_applications(
 
     query = select(Application)
     count_query = select(func.count(Application.id))
+
+    if auth.enforced:
+        tenant_id = require_tenant(auth)
+        query = query.where(Application.tenant_id == tenant_id)
+        count_query = count_query.where(Application.tenant_id == tenant_id)
+    elif auth.tenant_id:
+        query = query.where(Application.tenant_id == auth.tenant_id)
+        count_query = count_query.where(Application.tenant_id == auth.tenant_id)
 
     if status:
         query = query.where(Application.status == status)
@@ -127,7 +195,7 @@ async def list_applications(
     )
 
 
-async def get_application(db: AsyncSession, app_id: str) -> Application:
+async def get_application(db: AsyncSession, app_id: str, auth: AuthContext) -> Application:
     """Get a single application by ID.
 
     Args:
@@ -146,10 +214,11 @@ async def get_application(db: AsyncSession, app_id: str) -> Application:
     app = result.scalar_one_or_none()
     if app is None:
         raise RecordNotFoundError("Application", app_id)
+    ensure_tenant_access(auth, app.tenant_id)
     return app
 
 
-async def approve_application(db: AsyncSession, app_id: str) -> Application:
+async def approve_application(db: AsyncSession, app_id: str, auth: AuthContext) -> Application:
     """Approve a pending application for submission.
 
     Args:
@@ -162,7 +231,8 @@ async def approve_application(db: AsyncSession, app_id: str) -> Application:
     Raises:
         RecordNotFoundError: If application does not exist.
     """
-    app = await get_application(db, app_id)
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+    app = await get_application(db, app_id, auth)
     if app.status not in (ApplicationStatus.PENDING_REVIEW, ApplicationStatus.QUEUED):
         raise ValueError(
             f"Cannot approve application in '{app.status}' state. "
@@ -179,6 +249,7 @@ async def update_status(
     db: AsyncSession,
     app_id: str,
     update: ApplicationStatusUpdate,
+    auth: AuthContext,
 ) -> Application:
     """Update an application's status and optional notes.
 
@@ -193,7 +264,8 @@ async def update_status(
     Raises:
         RecordNotFoundError: If application does not exist.
     """
-    app = await get_application(db, app_id)
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.RECRUITER, Role.OPERATOR})
+    app = await get_application(db, app_id, auth)
     app.status = update.status
     if update.notes is not None:
         app.notes = update.notes

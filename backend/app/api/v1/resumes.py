@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db
+from app.api.deps import AuthContext, get_auth_context, get_db
 from app.core.exceptions import RecordNotFoundError
 from app.schemas.resume import (
     ResumeGenerateRequest,
@@ -40,7 +40,9 @@ ALLOWED_MIME_TYPES = {
 )
 async def upload_resume(
     file: UploadFile,
+    candidate_id: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> ResumeUploadResponse:
     """Upload a PDF or DOCX resume for parsing and storage."""
     # Validate file extension
@@ -67,7 +69,7 @@ async def upload_resume(
             raise HTTPException(status_code=413, detail="File too large. Max 10MB.")
     await file.seek(0)
 
-    return await resume_service.upload_resume(db, file)
+    return await resume_service.upload_resume(db, file, candidate_id=candidate_id, auth=auth)
 
 
 @router.get(
@@ -77,9 +79,10 @@ async def upload_resume(
 )
 async def list_resumes(
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> ResumeListResponse:
     """List all uploaded and generated resumes."""
-    return await resume_service.list_resumes(db)
+    return await resume_service.list_resumes(db, auth=auth)
 
 
 @router.post(
@@ -91,12 +94,13 @@ async def list_resumes(
 async def generate_resume(
     request: ResumeGenerateRequest,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> ResumeResponse:
     """Generate a job-tailored resume from a base resume.
 
     Uses LLM to rewrite content. Placeholder until Phase 5.
     """
-    return await resume_service.generate_tailored_resume(db, request)
+    return await resume_service.generate_tailored_resume(db, request, auth=auth)
 
 
 @router.post(
@@ -108,9 +112,10 @@ async def score_resume(
     resume_id: str,
     request: ResumeScoreRequest,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> ResumeScoreResponse:
     """Score a resume's ATS compatibility against a specific job."""
-    return await resume_service.score_resume(db, resume_id, request)
+    return await resume_service.score_resume(db, resume_id, request, auth=auth)
 
 
 @router.post(
@@ -122,13 +127,14 @@ async def optimize_resume(
     resume_id: str,
     request: ResumeOptimizeRequest = ResumeOptimizeRequest(),
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> ResumeResponse:
     """Optimize a resume for ATS keyword matching using LLM rewriting.
 
     Creates a new optimized resume linked to the original with improved
     ATS compatibility scores.
     """
-    return await resume_service.optimize_resume(db, resume_id, request.job_id)
+    return await resume_service.optimize_resume(db, resume_id, request.job_id, auth=auth)
 
 
 @router.get(
@@ -139,9 +145,10 @@ async def download_resume(
     resume_id: str,
     format: str = Query(default="pdf", pattern="^(pdf|docx)$"),
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> FileResponse:
     """Download a resume in PDF or DOCX format."""
-    resume = await resume_service.get_resume(db, resume_id)
+    resume = await resume_service.get_resume(db, resume_id, auth=auth)
 
     file_path = resume.file_path_pdf if format == "pdf" else resume.file_path_docx
     if not file_path or not Path(file_path).exists():
@@ -166,6 +173,7 @@ async def download_resume(
 async def extract_profile_from_resume(
     resume_id: str,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> CandidateProfileSchema:
     """Extract structured candidate profile data from a resume.
 
@@ -173,7 +181,7 @@ async def extract_profile_from_resume(
     section extraction and contact info regex to build a structured
     CandidateProfile that can pre-fill the profile editor.
     """
-    resume = await resume_service.get_resume(db, resume_id)
+    resume = await resume_service.get_resume(db, resume_id, auth=auth)
     content = resume.content_text or ""
 
     if not content.strip():

@@ -3,7 +3,7 @@
 from enum import StrEnum
 from functools import lru_cache
 
-from pydantic import SecretStr, field_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -74,6 +74,31 @@ class BrowserSettings(BaseSettings):
         return max(1, min(5, v))
 
 
+class FeatureFlagsSettings(BaseSettings):
+    """Runtime feature flags for incremental rollouts."""
+
+    model_config = SettingsConfigDict(env_prefix="FEATURE__")
+
+    tenant_enforcement: bool = False
+    workflow_v2_enabled: bool = False
+    audit_log_enabled: bool = True
+    scheduler_enabled: bool = False
+    watchdog_enabled: bool = True
+    manual_checkpoint_mode: bool = True
+    allow_legacy_unscoped_writes: bool = False
+    strict_tenant_startup_validation: bool = True
+
+
+class AuthSettings(BaseSettings):
+    """Authentication and principal resolution configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="AUTH__")
+
+    token_secret: SecretStr = SecretStr("dev-insecure-change-me")
+    token_ttl_seconds: int = 3600
+    allow_legacy_header_auth: bool = True
+
+
 class Settings(BaseSettings):
     """Root application settings."""
 
@@ -98,6 +123,8 @@ class Settings(BaseSettings):
     # Nested settings
     llm: LLMSettings = LLMSettings()
     browser: BrowserSettings = BrowserSettings()
+    feature_flags: FeatureFlagsSettings = FeatureFlagsSettings()
+    auth: AuthSettings = AuthSettings()
 
     # Job discovery
     exa_api_key: SecretStr = SecretStr("")
@@ -106,6 +133,21 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+
+    # Artifact storage
+    artifact_storage_provider: str = "local"
+    artifact_storage_local_root: str = "./data/artifacts"
+
+    artifact_storage_s3_bucket: str = ""
+    artifact_storage_s3_region: str = "us-east-1"
+    artifact_storage_s3_endpoint_url: str = ""
+    artifact_storage_s3_access_key_id: SecretStr = SecretStr("")
+    artifact_storage_s3_secret_access_key: SecretStr = SecretStr("")
+    artifact_storage_s3_session_token: SecretStr = SecretStr("")
+    artifact_storage_presign_ttl_seconds: int = 900
+
+    # Startup behavior
+    auto_create_schema_on_startup: bool = False
 
     @field_validator("min_ats_score")
     @classmethod
@@ -119,6 +161,29 @@ class Settings(BaseSettings):
         """Normalize log level to uppercase."""
         return v.upper()
 
+    @property
+    def strict_tenant_enforcement(self) -> bool:
+        """Effective strict enforcement in runtime (non-dev defaults to strict)."""
+        return self.feature_flags.tenant_enforcement or self.environment != Environment.DEVELOPMENT
+
+    @model_validator(mode="after")
+    def validate_production_safety(self) -> "Settings":
+        """Fail fast on broken high-risk production/staging configs."""
+        if self.environment in {Environment.STAGING, Environment.PRODUCTION}:
+            if self.auth.token_secret.get_secret_value() in {"", "dev-insecure-change-me"}:
+                raise ValueError("AUTH__TOKEN_SECRET must be set to a non-default value in staging/production")
+            if self.redis_url.strip() == "":
+                raise ValueError("REDIS_URL must be configured in staging/production")
+            if self.database_url.strip() == "":
+                raise ValueError("DATABASE_URL must be configured in staging/production")
+            provider = self.artifact_storage_provider.lower().strip()
+            if provider == "s3" and (
+                not self.artifact_storage_s3_bucket.strip()
+                or not self.artifact_storage_s3_access_key_id.get_secret_value().strip()
+                or not self.artifact_storage_s3_secret_access_key.get_secret_value().strip()
+            ):
+                raise ValueError("S3 artifact storage requires bucket/access key/secret key in staging/production")
+        return self
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

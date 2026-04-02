@@ -4,7 +4,7 @@ import structlog
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db
+from app.api.deps import AuthContext, get_auth_context, get_db
 from app.config.constants import DEFAULT_PAGE_SIZE
 from app.schemas.application import (
     ApplicationBatchCreate,
@@ -28,9 +28,10 @@ router = APIRouter()
 async def create_application(
     data: ApplicationCreate,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> ApplicationResponse:
     """Create a single job application."""
-    app = await app_service.create_application(db, data)
+    app = await app_service.create_application(db, data, auth)
     return ApplicationResponse.model_validate(app)
 
 
@@ -43,9 +44,10 @@ async def create_application(
 async def batch_create(
     data: ApplicationBatchCreate,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> list[ApplicationResponse]:
     """Create multiple job applications at once."""
-    apps = await app_service.create_batch(db, data)
+    apps = await app_service.create_batch(db, data, auth)
     return [ApplicationResponse.model_validate(a) for a in apps]
 
 
@@ -59,9 +61,10 @@ async def list_applications(
     page_size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=100),
     status: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> ApplicationListResponse:
     """List applications with pagination and optional status filter."""
-    return await app_service.list_applications(db, page, page_size, status)
+    return await app_service.list_applications(db, auth, page, page_size, status)
 
 
 @router.get(
@@ -72,9 +75,10 @@ async def list_applications(
 async def get_application(
     app_id: str,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> ApplicationResponse:
     """Get a single application by ID. Returns 404 if not found."""
-    app = await app_service.get_application(db, app_id)
+    app = await app_service.get_application(db, app_id, auth)
     return ApplicationResponse.model_validate(app)
 
 
@@ -86,9 +90,10 @@ async def get_application(
 async def approve_application(
     app_id: str,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> ApplicationResponse:
     """Approve a pending application for automated submission."""
-    app = await app_service.approve_application(db, app_id)
+    app = await app_service.approve_application(db, app_id, auth)
     return ApplicationResponse.model_validate(app)
 
 
@@ -101,7 +106,8 @@ async def update_status(
     app_id: str,
     update: ApplicationStatusUpdate,
     db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
 ) -> ApplicationResponse:
     """Update an application's status and optional notes."""
-    app = await app_service.update_status(db, app_id, update)
+    app = await app_service.update_status(db, app_id, update, auth)
     return ApplicationResponse.model_validate(app)

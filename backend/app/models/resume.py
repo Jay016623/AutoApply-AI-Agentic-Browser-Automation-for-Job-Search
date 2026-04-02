@@ -10,9 +10,10 @@ class Resume(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """A resume document (base or tailored)."""
 
     __tablename__ = "resumes"
-    __table_args__ = (Index("ix_resume_type", "type"),)
+    __table_args__ = (Index("ix_resume_type", "type"), Index("ix_resume_tenant", "tenant_id"))
 
     # Identity
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     type: Mapped[str] = mapped_column(String(20), nullable=False, default="base")
 
@@ -25,6 +26,11 @@ class Resume(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     job_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("jobs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    candidate_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("candidates.id", ondelete="SET NULL"),
         nullable=True,
     )
 

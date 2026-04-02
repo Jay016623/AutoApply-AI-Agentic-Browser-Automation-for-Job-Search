@@ -32,6 +32,7 @@ class StatusEnum(StrEnum):
 class ApplicationCreate(BaseModel):
     """Request to create a single job application."""
 
+    tenant_id: str | None = None
     job_id: str
     resume_id: str | None = None
     apply_mode: ApplyModeEnum = ApplyModeEnum.REVIEW
@@ -58,6 +59,7 @@ class ApplicationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    tenant_id: str | None = None
     job_id: str
     resume_id: str | None = None
     status: str

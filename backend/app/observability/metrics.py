@@ -80,6 +80,48 @@ queue_processing_duration_seconds = Histogram(
     buckets=[1, 5, 15, 30, 60, 120, 300],
 )
 
+queue_dead_letter_total = Counter(
+    "autoapply_queue_dead_letter_total",
+    "Total messages moved to dead-letter queues",
+    ["queue_name", "reason"],
+)
+
+workflow_transitions_total = Counter(
+    "autoapply_workflow_transitions_total",
+    "Workflow transition throughput",
+    ["to_state", "step_name", "status"],
+)
+
+retry_events_total = Counter(
+    "autoapply_retry_events_total",
+    "Total retry lifecycle events",
+    ["event_type", "status"],
+)
+
+review_queue_total = Counter(
+    "autoapply_review_queue_total",
+    "Review queue events",
+    ["event_type", "reason", "status"],
+)
+
+review_queue_open = Gauge(
+    "autoapply_review_queue_open",
+    "Current open review queue volume",
+    ["tenant_scope"],
+)
+
+automation_runs_total = Counter(
+    "autoapply_automation_runs_total",
+    "Automation run outcomes by platform",
+    ["platform", "outcome"],
+)
+
+artifact_storage_bytes_total = Counter(
+    "autoapply_artifact_storage_bytes_total",
+    "Cumulative artifact bytes stored",
+    ["backend", "artifact_type"],
+)
+
 # --- Document Metrics ---
 
 documents_generated_total = Counter(

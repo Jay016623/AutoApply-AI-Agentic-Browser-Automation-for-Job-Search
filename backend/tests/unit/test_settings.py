@@ -1,8 +1,16 @@
 """Tests for application settings configuration."""
 
 
+import pytest
 
-from app.config.settings import ApplyMode, BrowserSettings, Environment, LLMSettings, Settings
+from app.config.settings import (
+    ApplyMode,
+    BrowserSettings,
+    Environment,
+    FeatureFlagsSettings,
+    LLMSettings,
+    Settings,
+)
 
 
 class TestSettings:
@@ -36,6 +44,30 @@ class TestSettings:
         assert ApplyMode.AUTONOMOUS.value == "autonomous"
         assert ApplyMode.REVIEW.value == "review"
         assert ApplyMode.BATCH.value == "batch"
+
+    def test_strict_tenant_enforcement_defaults_on_outside_development(self) -> None:
+        settings = Settings(_env_file=None, environment=Environment.PRODUCTION)
+        assert settings.strict_tenant_enforcement is True
+
+    def test_production_requires_non_default_auth_secret(self) -> None:
+        with pytest.raises(ValueError, match="AUTH__TOKEN_SECRET"):
+            Settings(
+                _env_file=None,
+                environment=Environment.PRODUCTION,
+                auth={"token_secret": "dev-insecure-change-me"},
+            )
+
+    def test_production_s3_requires_credentials(self) -> None:
+        with pytest.raises(ValueError, match="S3 artifact storage requires"):
+            Settings(
+                _env_file=None,
+                environment=Environment.PRODUCTION,
+                auth={"token_secret": "prod-secret"},
+                artifact_storage_provider="s3",
+                artifact_storage_s3_bucket="",
+                artifact_storage_s3_access_key_id="",
+                artifact_storage_s3_secret_access_key="",
+            )
 
 
 class TestLLMSettings:
@@ -75,3 +107,18 @@ class TestBrowserSettings:
         """Browser should default to headless mode."""
         settings = BrowserSettings()
         assert settings.headless is True
+
+
+class TestFeatureFlagsSettings:
+    """Test feature flag defaults and parsing."""
+
+    def test_feature_flags_default_values(self) -> None:
+        flags = FeatureFlagsSettings()
+        assert flags.tenant_enforcement is False
+        assert flags.workflow_v2_enabled is False
+        assert flags.audit_log_enabled is True
+        assert flags.manual_checkpoint_mode is True
+
+    def test_settings_exposes_feature_flags_object(self) -> None:
+        settings = Settings(_env_file=None)
+        assert isinstance(settings.feature_flags, FeatureFlagsSettings)

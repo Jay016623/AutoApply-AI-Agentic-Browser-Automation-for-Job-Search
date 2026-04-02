@@ -7,6 +7,7 @@ score with ATS, apply via platform, and broadcast progress.
 
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -20,14 +21,579 @@ from app.core.automation.platforms.base import JobListing
 from app.core.exceptions import AutoApplyError
 from app.db.redis import get_redis, init_redis_pool
 from app.db.session import async_session_factory
+from app.domains.applications.execution import (
+    AdapterFailureClass,
+    ApplicationAttemptService,
+    ExecutionContext,
+    PlatformApplyAdapter,
+    RiskSignals,
+    apply_policy,
+    score_risk,
+)
+from app.domains.applications.workflow import WorkflowService, WorkflowState
 from app.models.application import Application
 from app.models.job import Job
+from app.models.tenant import Tenant
 from app.models.resume import Resume
+from app.observability.metrics import automation_runs_total
 from app.schemas.resume import ResumeGenerateRequest
-from app.services import resume as resume_service
-from app.services.queue import dequeue
+from app.schemas.review import ReviewTaskCreate
+from app.services import resume as resume_service, review_queue
+from app.services import control_plane
+from app.services.queue import lease_message
+from app.workers.orchestration import process_apply_message
 
 logger = structlog.get_logger(__name__)
+
+
+
+def _map_failure_category_to_review_reason(category: str | None, manual_reason: str | None = None) -> str:
+    category = (category or "").lower()
+    reason = (manual_reason or "").lower()
+    if "incomplete" in reason or "missing" in reason:
+        return "missing_required_fields"
+    if category in {"auth_expired", "captcha"}:
+        return "captcha_detected"
+    if category in {"unsupported_ui", "unknown"}:
+        return "unknown_ui_pattern"
+    if category in {"selector_drift"}:
+        return "selector_drift"
+    if category in {"duplicate_application"}:
+        return "duplicate_application_risk"
+    if category in {"timeout", "upload_failed"}:
+        return "ambiguous_form_state"
+    return "ambiguous_form_state"
+
+
+async def _create_review_task(
+    *,
+    tenant_id: str | None,
+    application_id: str,
+    workflow_run_id: str,
+    reason: str,
+    details: dict[str, Any],
+    idempotency_key: str,
+) -> None:
+    async with async_session_factory() as db:
+        await review_queue.create_review_task(
+            db,
+            ReviewTaskCreate(
+                tenant_id=tenant_id,
+                application_id=application_id,
+                workflow_run_id=workflow_run_id,
+                reason=reason,
+                risk_level="high",
+                details_json=details,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+_WORKFLOW_PROGRESS_ORDER: list[WorkflowState] = [
+    WorkflowState.DISCOVERED,
+    WorkflowState.MATCHED,
+    WorkflowState.SHORTLISTED,
+    WorkflowState.TAILORED,
+    WorkflowState.READY_TO_APPLY,
+    WorkflowState.APPLYING,
+    WorkflowState.SUBMITTED,
+]
+
+
+def _state_reached(current_state: WorkflowState, target_state: WorkflowState) -> bool:
+    """Return True when the workflow has already reached/passed target_state."""
+    if current_state in (WorkflowState.FAILED_MANUAL, WorkflowState.FAILED_RETRYABLE, WorkflowState.ABANDONED):
+        return False
+    return _WORKFLOW_PROGRESS_ORDER.index(current_state) >= _WORKFLOW_PROGRESS_ORDER.index(target_state)
+
+
+async def _ensure_workflow_run(application_id: str, job_id: str) -> tuple[str, WorkflowState]:
+    """Get or create workflow run for application and persist link if available."""
+    async with async_session_factory() as db:
+        workflow_service = WorkflowService(db)
+        result = await db.execute(select(Application).where(Application.id == application_id))
+        application = result.scalar_one_or_none()
+        if not isinstance(application, Application):
+            application = None
+
+        run_id: str | None = application.workflow_run_id if application is not None else None
+        if run_id:
+            run = await workflow_service.get_run(run_id)
+            return run.id, WorkflowState(run.current_state)
+
+        run = await workflow_service.create_run(
+            candidate_id=application_id,
+            tenant_id=application.tenant_id if application is not None else None,
+            job_id=job_id or None,
+        )
+        if application is not None:
+            application.workflow_run_id = run.id
+            await db.commit()
+        return run.id, WorkflowState(run.current_state)
+
+
+async def _transition_workflow_state(
+    workflow_run_id: str,
+    target_state: WorkflowState,
+    idempotency_key: str,
+    step_name: str,
+    error_message: str | None = None,
+) -> WorkflowState:
+    """Apply a durable workflow transition and return updated state."""
+    async with async_session_factory() as db:
+        workflow_service = WorkflowService(db)
+        run = await workflow_service.transition_state(
+            run_id=workflow_run_id,
+            target_state=target_state,
+            idempotency_key=idempotency_key,
+            step_name=step_name,
+            error_message=error_message,
+        )
+        return WorkflowState(run.current_state)
+
+
+async def _execute_attempt_path(
+    *,
+    payload: dict[str, Any],
+    app_id: str,
+    job: Job,
+    workflow_run_id: str | None,
+    platform_name: str,
+    resume_path: str,
+) -> tuple[bool, str | None, bool, str | None]:
+    """Run durable, resumable attempt execution for submit path."""
+    tenant_id = payload.get("tenant_id") or job.tenant_id
+    candidate_id = payload.get("candidate_id")
+    manual_reason = payload.get("manual_checkpoint_reason")
+    manual_override = bool(payload.get("manual_checkpoint_mode"))
+    job_match_confidence = float(payload.get("ats_score") or 0.75)
+    execution_key = payload.get("execution_idempotency_key") or f"{app_id}:{workflow_run_id or 'none'}:v1"
+    medium_risk_requires_review = await _medium_risk_requires_review(tenant_id)
+
+    async with async_session_factory() as db:
+        attempt_service = ApplicationAttemptService(db, tenant_scope=tenant_id)
+        attempt = await attempt_service.create_or_get_attempt(
+            tenant_id=tenant_id,
+            application_id=app_id,
+            workflow_run_id=workflow_run_id,
+            candidate_id=candidate_id,
+            job_id=job.id,
+            idempotency_key=execution_key,
+        )
+        await attempt_service.start_attempt(attempt.id)
+        next_sequence = await attempt_service.get_resume_sequence(attempt.id)
+
+        step_names = [
+            "prepare_execution_context",
+            "start_browser_apply",
+            "upload_documents",
+            "submit",
+            "verify_submission",
+            "store_proof_artifacts",
+        ]
+        adapter = PlatformApplyAdapter()
+        adapter_result: Any | None = None
+        verification_result: Any | None = None
+
+        async def _write_step_log(step_id: str, step_name: str, payload: dict[str, Any]) -> None:
+            await attempt_service.store_structured_artifact(
+                tenant_id=tenant_id,
+                application_id=app_id,
+                workflow_run_id=workflow_run_id,
+                attempt_id=attempt.id,
+                attempt_step_id=step_id,
+                artifact_type="execution_log",
+                payload={
+                    "step_name": step_name,
+                    "attempt_id": attempt.id,
+                    "application_id": app_id,
+                    "payload": payload,
+                },
+                metadata_json={"category": "step_execution"},
+            )
+
+        for offset, step_name in enumerate(step_names):
+            seq = next_sequence + offset
+            step = await attempt_service.record_step_started(
+                attempt_id=attempt.id,
+                step_name=step_name,
+                sequence_number=seq,
+                idempotency_key=f"{attempt.id}:{step_name}",
+                input_snapshot_json={"platform": platform_name, "application_id": app_id},
+            )
+            if step.status == "completed":
+                continue
+
+            if step_name == "prepare_execution_context":
+                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"job_id": job.id})
+                await _write_step_log(step.id, step_name, {"job_id": job.id})
+            elif step_name == "start_browser_apply":
+                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"driver": "platform_adapter"})
+                await _write_step_log(step.id, step_name, {"driver": "platform_adapter"})
+            elif step_name == "upload_documents":
+                await attempt_service.record_step_completed(
+                    step_id=step.id,
+                    output_snapshot_json={"resume_path": resume_path or ""},
+                )
+                await _write_step_log(step.id, step_name, {"resume_path": resume_path or ""})
+            elif step_name == "submit":
+                job_listing = JobListing(
+                    platform=job.platform,
+                    platform_job_id=job.platform_job_id,
+                    title=job.title,
+                    company=job.company,
+                    location=job.location or "",
+                    url=job.url,
+                    description=job.description or "",
+                    job_type=job.job_type or "",
+                    remote=job.remote or False,
+                )
+                exec_context = ExecutionContext(
+                    tenant_id=tenant_id,
+                    application_id=app_id,
+                    workflow_run_id=workflow_run_id,
+                    attempt_id=attempt.id,
+                    platform_name=platform_name,
+                    job_listing=job_listing,
+                    resume_path=resume_path,
+                    manual_checkpoint_mode=bool(payload.get("manual_checkpoint_mode")),
+                    manual_checkpoint_reason=manual_reason,
+                    verification_hints=payload.get("verification_evidence", {}) or {},
+                )
+                prepared_context = await adapter.prepare(exec_context)
+                before_submit_flags: set[str] = set()
+                if job_match_confidence < 0.55:
+                    before_submit_flags.add("low_confidence_match")
+                if resume_path == "":
+                    before_submit_flags.add("missing_required_fields")
+                before_submit_scored = score_risk(
+                    RiskSignals(
+                        job_match_confidence=job_match_confidence,
+                        document_tailoring_confidence=0.8 if resume_path else 0.5,
+                        submission_verification_confidence=0.6,
+                        flags=before_submit_flags,
+                    ),
+                )
+                before_submit_decision = apply_policy(
+                    scored=before_submit_scored,
+                    medium_risk_requires_review=medium_risk_requires_review,
+                    manual_override=manual_override,
+                )
+                await attempt_service.record_risk_evaluation(
+                    attempt.id,
+                    risk_score=before_submit_decision.risk_score,
+                    confidence_score=before_submit_decision.confidence_score,
+                    risk_level=before_submit_decision.risk_level,
+                    stage="before_submission",
+                    route_to_review=before_submit_decision.route_to_review,
+                    reason=before_submit_decision.reason,
+                )
+                if before_submit_decision.route_to_review:
+                    route_reason = before_submit_decision.reason or "ambiguous_form_state"
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="RISK_POLICY_ROUTE",
+                        error_message=f"Routed to review before submission ({route_reason})",
+                        retryable=False,
+                        manual_checkpoint_reason=f"risk_policy:{route_reason}",
+                    )
+                    await _create_review_task(
+                        tenant_id=job.tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        reason=route_reason,
+                        details={
+                            "stage": "before_submission",
+                            "risk_score": before_submit_decision.risk_score,
+                            "confidence_score": before_submit_decision.confidence_score,
+                            "risk_level": before_submit_decision.risk_level,
+                        },
+                        idempotency_key=f"{app_id}:review:risk:before_submission",
+                    )
+                    return False, "Routed to review by risk policy before submission", False, route_reason
+                await attempt_service.store_structured_artifact(
+                    tenant_id=tenant_id,
+                    application_id=app_id,
+                    workflow_run_id=workflow_run_id,
+                    attempt_id=attempt.id,
+                    attempt_step_id=step.id,
+                    artifact_type="execution_request",
+                    payload={
+                        "platform": platform_name,
+                        "job_id": job.id,
+                        "application_id": app_id,
+                        "workflow_run_id": workflow_run_id,
+                        "manual_checkpoint_mode": bool(payload.get("manual_checkpoint_mode")),
+                    },
+                    metadata_json={"category": "request_payload"},
+                )
+                adapter_result = await adapter.execute(prepared_context)
+                post_fill_flags: set[str] = set()
+                if adapter_result.failure_category is not None:
+                    category = adapter_result.failure_category.value
+                    if category == "captcha":
+                        post_fill_flags.add("captcha_detected")
+                    elif category == "selector_drift":
+                        post_fill_flags.add("selector_drift")
+                    elif category == "unsupported_ui":
+                        post_fill_flags.add("unknown_ui_pattern")
+                    elif category == "duplicate_application":
+                        post_fill_flags.add("duplicate_application_risk")
+                    else:
+                        post_fill_flags.add("ambiguous_form_state")
+                post_fill_scored = score_risk(
+                    RiskSignals(
+                        job_match_confidence=job_match_confidence,
+                        document_tailoring_confidence=0.8 if resume_path else 0.5,
+                        submission_verification_confidence=0.55 if adapter_result.success else 0.3,
+                        flags=post_fill_flags,
+                    ),
+                )
+                post_fill_decision = apply_policy(
+                    scored=post_fill_scored,
+                    medium_risk_requires_review=medium_risk_requires_review,
+                    manual_override=manual_override,
+                )
+                await attempt_service.record_risk_evaluation(
+                    attempt.id,
+                    risk_score=post_fill_decision.risk_score,
+                    confidence_score=post_fill_decision.confidence_score,
+                    risk_level=post_fill_decision.risk_level,
+                    stage="after_form_fill",
+                    route_to_review=post_fill_decision.route_to_review,
+                    reason=post_fill_decision.reason,
+                )
+                if post_fill_decision.route_to_review:
+                    route_reason = post_fill_decision.reason or "ambiguous_form_state"
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="RISK_POLICY_ROUTE",
+                        error_message=f"Routed to review after form fill ({route_reason})",
+                        retryable=False,
+                        manual_checkpoint_reason=f"risk_policy:{route_reason}",
+                    )
+                    await _create_review_task(
+                        tenant_id=job.tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        reason=route_reason,
+                        details={
+                            "stage": "after_form_fill",
+                            "risk_score": post_fill_decision.risk_score,
+                            "confidence_score": post_fill_decision.confidence_score,
+                            "risk_level": post_fill_decision.risk_level,
+                        },
+                        idempotency_key=f"{app_id}:review:risk:after_form_fill",
+                    )
+                    return False, "Routed to review by risk policy after form fill", False, route_reason
+                await attempt_service.store_structured_artifact(
+                    tenant_id=tenant_id,
+                    application_id=app_id,
+                    workflow_run_id=workflow_run_id,
+                    attempt_id=attempt.id,
+                    attempt_step_id=step.id,
+                    artifact_type="execution_response",
+                    payload={
+                        "success": bool(adapter_result.success),
+                        "error_code": adapter_result.error_code,
+                        "error_message": adapter_result.error_message,
+                        "failure_category": (
+                            adapter_result.failure_category.value if adapter_result.failure_category else None
+                        ),
+                        "submission_url": adapter_result.submission_url,
+                    },
+                    metadata_json={"category": "response_payload"},
+                )
+                failure_class = adapter.classify_failure(adapter_result)
+                if failure_class != AdapterFailureClass.NONE:
+                    retryable = failure_class == AdapterFailureClass.RETRYABLE
+                    manual_reason = adapter_result.error_message if not retryable else None
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code=adapter_result.error_code or "APPLY_ADAPTER_FAILED",
+                        error_message=adapter_result.error_message or "Application execution failed",
+                        retryable=retryable,
+                        manual_checkpoint_reason=manual_reason,
+                    )
+                    return (
+                        False,
+                        adapter_result.error_message or "Application execution failed",
+                        retryable,
+                        adapter_result.failure_category.value if adapter_result.failure_category else None,
+                    )
+                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"applied": True})
+                await _write_step_log(
+                    step.id,
+                    step_name,
+                    {
+                        "applied": True,
+                        "platform": platform_name,
+                    },
+                )
+            elif step_name == "verify_submission":
+                if adapter_result is None:
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="ADAPTER_RESULT_MISSING",
+                        error_message="Adapter result missing before verification",
+                        retryable=False,
+                        manual_checkpoint_reason="Adapter execution contract violated",
+                    )
+                    return False, "Adapter result missing before verification", False, "unsupported_ui"
+                verification_result = adapter.verify(adapter_result)
+                verification_flags: set[str] = set()
+                if not verification_result.verified:
+                    if verification_result.failure_category is not None:
+                        category = verification_result.failure_category.value
+                        if category == "captcha":
+                            verification_flags.add("captcha_detected")
+                        elif category == "selector_drift":
+                            verification_flags.add("selector_drift")
+                        elif category == "duplicate_application":
+                            verification_flags.add("duplicate_application_risk")
+                        elif category == "unsupported_ui":
+                            verification_flags.add("unknown_ui_pattern")
+                        else:
+                            verification_flags.add("ambiguous_form_state")
+                    else:
+                        verification_flags.add("ambiguous_form_state")
+                verification_scored = score_risk(
+                    RiskSignals(
+                        job_match_confidence=job_match_confidence,
+                        document_tailoring_confidence=0.8 if resume_path else 0.5,
+                        submission_verification_confidence=0.9 if verification_result.verified else 0.2,
+                        flags=verification_flags,
+                    ),
+                )
+                verification_decision = apply_policy(
+                    scored=verification_scored,
+                    medium_risk_requires_review=medium_risk_requires_review,
+                    manual_override=manual_override,
+                )
+                await attempt_service.record_risk_evaluation(
+                    attempt.id,
+                    risk_score=verification_decision.risk_score,
+                    confidence_score=verification_decision.confidence_score,
+                    risk_level=verification_decision.risk_level,
+                    stage="after_verification",
+                    route_to_review=verification_decision.route_to_review,
+                    reason=verification_decision.reason,
+                )
+                if verification_decision.route_to_review:
+                    route_reason = verification_decision.reason or "ambiguous_form_state"
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="RISK_POLICY_ROUTE",
+                        error_message=f"Routed to review after verification ({route_reason})",
+                        retryable=False,
+                        manual_checkpoint_reason=f"risk_policy:{route_reason}",
+                    )
+                    await _create_review_task(
+                        tenant_id=job.tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        reason=route_reason,
+                        details={
+                            "stage": "after_verification",
+                            "risk_score": verification_decision.risk_score,
+                            "confidence_score": verification_decision.confidence_score,
+                            "risk_level": verification_decision.risk_level,
+                        },
+                        idempotency_key=f"{app_id}:review:risk:after_verification",
+                    )
+                    return False, "Routed to review by risk policy after verification", False, route_reason
+                if not verification_result.verified:
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="SUBMISSION_NOT_VERIFIED",
+                        error_message=verification_result.reason or "Submission verification failed",
+                        retryable=verification_result.retryable,
+                        manual_checkpoint_reason=(
+                            verification_result.reason or "verification_failed"
+                            if verification_result.requires_manual_checkpoint or not verification_result.retryable
+                            else None
+                        ),
+                    )
+                    return (
+                        False,
+                        verification_result.reason or "Submission verification failed",
+                        verification_result.retryable,
+                        verification_result.failure_category.value if verification_result.failure_category else "unknown",
+                    )
+                await attempt_service.record_step_completed(step_id=step.id, output_snapshot_json={"verified": True})
+                await _write_step_log(
+                    step.id,
+                    step_name,
+                    {
+                        "verified": True,
+                        "classification": verification_result.classification,
+                        "evidence_keys": list((verification_result.evidence or {}).keys()),
+                    },
+                )
+            else:
+                if adapter_result is None:
+                    await attempt_service.record_step_failed(
+                        step_id=step.id,
+                        error_code="ARTIFACTS_WITHOUT_RESULT",
+                        error_message="Cannot collect artifacts without adapter result",
+                        retryable=False,
+                        manual_checkpoint_reason="artifacts_result_missing",
+                    )
+                    return False, "Cannot collect artifacts without adapter result", False, "unsupported_ui"
+                artifacts = adapter.collect_artifacts(adapter_result)
+                last_artifact = None
+                for artifact in artifacts:
+                    payload_metadata = artifact.metadata if isinstance(artifact.metadata, dict) else {"value": str(artifact.metadata)}
+                    source_file_path = payload_metadata.get("path") if isinstance(payload_metadata, dict) else None
+                    if isinstance(source_file_path, str) and Path(source_file_path).exists():
+                        last_artifact = await attempt_service.store_file_artifact(
+                            tenant_id=tenant_id,
+                            application_id=app_id,
+                            workflow_run_id=workflow_run_id,
+                            attempt_id=attempt.id,
+                            attempt_step_id=step.id,
+                            artifact_type=artifact.artifact_type,
+                            source_path=source_file_path,
+                            metadata_json={
+                                "category": "adapter_artifact",
+                                "verification_linked": True,
+                                "source_path": artifact.storage_path,
+                                "captured_path": source_file_path,
+                            },
+                        )
+                    else:
+                        last_artifact = await attempt_service.store_structured_artifact(
+                            tenant_id=tenant_id,
+                            application_id=app_id,
+                            workflow_run_id=workflow_run_id,
+                            attempt_id=attempt.id,
+                            attempt_step_id=step.id,
+                            artifact_type=artifact.artifact_type,
+                            payload={
+                                "source_path": artifact.storage_path,
+                                "step_name": step_name,
+                                "verification_classification": verification_result.classification if verification_result else "failed",
+                                "metadata": payload_metadata,
+                            },
+                            metadata_json={
+                                "category": "adapter_artifact",
+                                "verification_linked": True,
+                                "source_path": artifact.storage_path,
+                            },
+                        )
+                await attempt_service.record_step_completed(
+                    step_id=step.id,
+                    output_snapshot_json={
+                        "artifact_count": len(artifacts),
+                        "artifact_id": last_artifact.id if last_artifact else None,
+                        "verification": verification_result.verified if verification_result else False,
+                        "verification_classification": (
+                            verification_result.classification if verification_result else "failed"
+                        ),
+                    },
+                )
+
+        await attempt_service.complete_attempt(attempt.id)
+        return True, None, False, None
 
 
 async def _broadcast_progress(
@@ -188,21 +754,39 @@ async def process_application(payload: dict[str, Any]) -> None:
     # Validate platform is registered
     if not platform_registry.has(platform_name):
         logger.error("worker.unknown_platform", platform=platform_name)
+        unsupported_msg = f"Unsupported platform for automated apply: {platform_name}"
         await _update_application_status(
             app_id,
             ApplicationStatus.FAILED,
-            notes=f"Unknown platform: {platform_name}",
+            notes=unsupported_msg,
         )
         await _broadcast_progress(
             app_id,
             ApplicationStatus.FAILED,
-            detail=f"Unknown platform: {platform_name}",
+            detail=unsupported_msg,
         )
+        try:
+            workflow_run_id, _ = await _ensure_workflow_run(app_id, job_id)
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_MANUAL,
+                idempotency_key=f"{app_id}:failed-unsupported-platform",
+                step_name="submit_application",
+                error_message=unsupported_msg,
+            )
+        except Exception:
+            logger.warning("worker.workflow_failure_record_failed", app_id=app_id)
         return
 
     try:
         settings = get_settings()
         min_score = settings.min_ats_score
+        workflow_run_id, workflow_state = await _ensure_workflow_run(app_id, job_id)
+
+        if workflow_state == WorkflowState.SUBMITTED:
+            await _update_application_status(app_id, ApplicationStatus.APPLIED)
+            await _broadcast_progress(app_id, ApplicationStatus.APPLIED, detail="Already submitted in previous workflow run")
+            return
 
         # --------------------------------------------------------------
         # Step 1: Load job details from DB
@@ -229,88 +813,182 @@ async def process_application(payload: dict[str, Any]) -> None:
             await _broadcast_progress(
                 app_id, ApplicationStatus.FAILED, detail=error_msg,
             )
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_MANUAL,
+                idempotency_key=f"{app_id}:failed-job-load",
+                step_name="load_job",
+                error_message=error_msg,
+            )
             return
+
+        app_tenant_id: str | None = None
+        async with async_session_factory() as db:
+            app_result = await db.execute(select(Application).where(Application.id == app_id))
+            application_row = app_result.scalar_one_or_none()
+            if application_row is not None:
+                app_tenant_id = application_row.tenant_id
+        if app_tenant_id and job.tenant_id and app_tenant_id != job.tenant_id:
+            error_msg = "Application/job tenant mismatch"
+            await _update_application_status(app_id, ApplicationStatus.FAILED, notes=error_msg)
+            await _broadcast_progress(app_id, ApplicationStatus.FAILED, detail=error_msg)
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_MANUAL,
+                idempotency_key=f"{app_id}:failed-tenant-mismatch",
+                step_name="load_job",
+                error_message=error_msg,
+            )
+            return
+
+        if not _state_reached(workflow_state, WorkflowState.MATCHED):
+            workflow_state = await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.MATCHED,
+                idempotency_key=f"{app_id}:matched",
+                step_name="load_job",
+            )
+
+        if not _state_reached(workflow_state, WorkflowState.SHORTLISTED):
+            workflow_state = await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.SHORTLISTED,
+                idempotency_key=f"{app_id}:shortlisted",
+                step_name="shortlist",
+            )
 
         # --------------------------------------------------------------
         # Step 2: Generate tailored resume + cover letter
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "generating_resume")
         resume_path: str | None = None
-        try:
-            if resume_id:
-                async with async_session_factory() as db:
-                    gen_request = ResumeGenerateRequest(
-                        base_resume_id=resume_id,
-                        job_id=job_id,
-                        template_id="modern",
-                    )
-                    tailored_resp = (
-                        await resume_service.generate_tailored_resume(
-                            db, gen_request,
+        if not _state_reached(workflow_state, WorkflowState.TAILORED):
+            await _broadcast_progress(app_id, "generating_resume")
+            try:
+                if resume_id:
+                    async with async_session_factory() as db:
+                        gen_request = ResumeGenerateRequest(
+                            base_resume_id=resume_id,
+                            job_id=job_id,
+                            template_id="modern",
                         )
-                    )
-                    result = await db.execute(
-                        select(Resume).where(
-                            Resume.id == tailored_resp.id,
-                        ),
-                    )
-                    tailored_resume = result.scalar_one_or_none()
+                        tailored_resp = (
+                            await resume_service.generate_tailored_resume(
+                                db,
+                                gen_request,
+                                allow_system=True,
+                                system_tenant_id=job.tenant_id,
+                            )
+                        )
+                        result = await db.execute(
+                            select(Resume).where(
+                                Resume.id == tailored_resp.id,
+                            ),
+                        )
+                        tailored_resume = result.scalar_one_or_none()
 
-                if tailored_resume:
-                    resume_path = (
-                        tailored_resume.file_path_pdf
-                        or tailored_resume.file_path_docx
-                    )
-                    logger.info(
-                        "worker.resume_generated",
-                        resume_id=tailored_resume.id,
-                    )
-            else:
-                logger.info("worker.no_base_resume", app_id=app_id)
-        except Exception as exc:
-            logger.warning(
-                "worker.resume_generation_failed",
-                app_id=app_id,
-                error=str(exc),
+                    if tailored_resume:
+                        resume_path = (
+                            tailored_resume.file_path_pdf
+                            or tailored_resume.file_path_docx
+                        )
+                        logger.info(
+                            "worker.resume_generated",
+                            resume_id=tailored_resume.id,
+                        )
+                else:
+                    logger.info("worker.no_base_resume", app_id=app_id)
+            except Exception as exc:
+                error_msg = f"Resume tailoring risk detected: {exc}"
+                logger.warning(
+                    "worker.resume_generation_failed",
+                    app_id=app_id,
+                    error=str(exc),
+                )
+                await _update_application_status(app_id, ApplicationStatus.FAILED, notes=error_msg)
+                await _transition_workflow_state(
+                    workflow_run_id,
+                    WorkflowState.FAILED_MANUAL,
+                    idempotency_key=f"{app_id}:failed-tailoring-risk",
+                    step_name="tailor_resume",
+                    error_message=error_msg,
+                )
+                await _create_review_task(
+                    tenant_id=job.tenant_id,
+                    application_id=app_id,
+                    workflow_run_id=workflow_run_id,
+                    reason="risky_tailoring",
+                    details={"message": error_msg},
+                    idempotency_key=f"{app_id}:review:risky-tailoring",
+                )
+                return
+
+            workflow_state = await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.TAILORED,
+                idempotency_key=f"{app_id}:tailored",
+                step_name="tailor_resume",
             )
 
         # --------------------------------------------------------------
         # Step 3: Score with ATS
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "scoring_ats")
         ats_score: float | None = None
-        try:
-            ats_score = await _run_ats_scoring(job, resume_id)
-            logger.info(
-                "worker.ats_scored", app_id=app_id, score=ats_score,
-            )
-        except Exception as exc:
-            logger.warning(
-                "worker.ats_scoring_failed",
-                app_id=app_id,
-                error=str(exc),
-            )
+        if not _state_reached(workflow_state, WorkflowState.READY_TO_APPLY):
+            await _broadcast_progress(app_id, "scoring_ats")
+            try:
+                ats_score = await _run_ats_scoring(job, resume_id)
+                logger.info(
+                    "worker.ats_scored", app_id=app_id, score=ats_score,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "worker.ats_scoring_failed",
+                    app_id=app_id,
+                    error=str(exc),
+                )
 
-        if ats_score is not None and ats_score < min_score:
-            skip_msg = (
-                f"ATS score {ats_score:.2f} below minimum "
-                f"threshold {min_score:.2f}"
+            if ats_score is not None and ats_score < min_score:
+                skip_msg = (
+                    f"ATS score {ats_score:.2f} below minimum "
+                    f"threshold {min_score:.2f}"
+                )
+                logger.info(
+                    "worker.ats_below_threshold",
+                    app_id=app_id,
+                    score=ats_score,
+                )
+                await _update_application_status(
+                    app_id,
+                    ApplicationStatus.FAILED,
+                    notes=skip_msg,
+                    ats_score=ats_score,
+                )
+                await _broadcast_progress(
+                    app_id, ApplicationStatus.FAILED, detail=skip_msg,
+                )
+                await _transition_workflow_state(
+                    workflow_run_id,
+                    WorkflowState.FAILED_MANUAL,
+                    idempotency_key=f"{app_id}:failed-ats-threshold",
+                    step_name="score_ats",
+                    error_message=skip_msg,
+                )
+                await _create_review_task(
+                    tenant_id=job.tenant_id,
+                    application_id=app_id,
+                    workflow_run_id=workflow_run_id,
+                    reason="low_confidence_match",
+                    details={"ats_score": ats_score, "threshold": min_score, "message": skip_msg},
+                    idempotency_key=f"{app_id}:review:low-confidence-match",
+                )
+                return
+
+            workflow_state = await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.READY_TO_APPLY,
+                idempotency_key=f"{app_id}:ready-to-apply",
+                step_name="score_ats",
             )
-            logger.info(
-                "worker.ats_below_threshold",
-                app_id=app_id,
-                score=ats_score,
-            )
-            await _update_application_status(
-                app_id,
-                ApplicationStatus.FAILED,
-                notes=skip_msg,
-                ats_score=ats_score,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=skip_msg,
-            )
-            return
 
         logger.debug("worker.ats_threshold", min_score=min_score)
 
@@ -318,60 +996,128 @@ async def process_application(payload: dict[str, Any]) -> None:
         # Step 4: Apply via platform
         # --------------------------------------------------------------
         await _broadcast_progress(app_id, "submitting")
+        if job.tenant_id:
+            async with async_session_factory() as quota_db:
+                try:
+                    await control_plane.enforce_quota(
+                        quota_db,
+                        tenant_id=job.tenant_id,
+                        quota_key="automation_concurrency",
+                        increment=1,
+                        context={"operation": "worker_submit", "application_id": app_id},
+                    )
+                except control_plane.QuotaExceededError as exc:
+                    quota_message = f"Automation concurrency quota exceeded: {exc}"
+                    await _update_application_status(app_id, ApplicationStatus.FAILED, notes=quota_message, ats_score=ats_score)
+                    await _broadcast_progress(app_id, ApplicationStatus.FAILED, detail=quota_message)
+                    await _create_review_task(
+                        tenant_id=job.tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        reason="uncertain_submission",
+                        details={"quota": "automation_concurrency", "message": quota_message},
+                        idempotency_key=f"{app_id}:review:quota:automation-concurrency",
+                    )
+                    return
+        if not _state_reached(workflow_state, WorkflowState.APPLYING):
+            workflow_state = await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.APPLYING,
+                idempotency_key=f"{app_id}:applying",
+                step_name="submit_application",
+            )
         try:
-            platform = platform_registry.create(platform_name)
-
-            job_listing = JobListing(
-                platform=job.platform,
-                platform_job_id=job.platform_job_id,
-                title=job.title,
-                company=job.company,
-                location=job.location or "",
-                url=job.url,
-                description=job.description or "",
-                job_type=job.job_type or "",
-                remote=job.remote or False,
-            )
-
-            applied = await platform.apply(
-                job=job_listing,
+            payload["ats_score"] = ats_score
+            applied, submit_error, submit_retryable, submit_failure_category = await _execute_attempt_path(
+                payload=payload,
+                app_id=app_id,
+                job=job,
+                workflow_run_id=workflow_run_id,
+                platform_name=platform_name,
                 resume_path=resume_path or "",
-                cover_letter_path=None,
             )
-
             if not applied:
-                raise AutoApplyError(
-                    "Platform returned unsuccessful apply result",
-                    code="PLATFORM_APPLY_FAILED",
-                )
+                automation_runs_total.labels(platform=platform_name, outcome="failure").inc()
+                if payload.get("manual_checkpoint_mode") or not submit_retryable:
+                    await _update_application_status(
+                        app_id,
+                        ApplicationStatus.FAILED,
+                        notes=f"Manual checkpoint required: {submit_error} (category={submit_failure_category or 'unknown'})",
+                        ats_score=ats_score,
+                    )
+                    await _broadcast_progress(
+                        app_id,
+                        ApplicationStatus.FAILED,
+                        detail=f"Manual checkpoint required: {submit_error} (category={submit_failure_category or 'unknown'})",
+                    )
+                    await _transition_workflow_state(
+                        workflow_run_id,
+                        WorkflowState.FAILED_MANUAL,
+                        idempotency_key=f"{app_id}:manual-checkpoint:{submit_failure_category or 'unknown'}",
+                        step_name="submit_application",
+                        error_message=submit_error,
+                    )
+                    await _create_review_task(
+                        tenant_id=job.tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        reason=_map_failure_category_to_review_reason(submit_failure_category, payload.get("manual_checkpoint_reason")),
+                        details={
+                            "submit_error": submit_error,
+                            "failure_category": submit_failure_category,
+                            "manual_checkpoint_mode": bool(payload.get("manual_checkpoint_mode")),
+                        },
+                        idempotency_key=f"{app_id}:review:submit:{submit_failure_category or 'unknown'}",
+                    )
+                else:
+                    await _update_application_status(
+                        app_id,
+                        ApplicationStatus.FAILED,
+                        notes=f"{submit_error} (category={submit_failure_category or 'unknown'})",
+                        ats_score=ats_score,
+                    )
+                    await _broadcast_progress(
+                        app_id, ApplicationStatus.FAILED, detail=f"{submit_error} (category={submit_failure_category or 'unknown'})",
+                    )
+                    await _transition_workflow_state(
+                        workflow_run_id,
+                        WorkflowState.FAILED_RETRYABLE,
+                        idempotency_key=f"{app_id}:failed-submit:{submit_failure_category or 'unknown'}",
+                        step_name="submit_application",
+                        error_message=submit_error,
+                    )
+                return
         except KeyError as exc:
             error_msg = f"Platform creation failed: {exc}"
-            logger.error(
-                "worker.platform_create_failed", error=str(exc),
-            )
-            await _update_application_status(
-                app_id, ApplicationStatus.FAILED, notes=error_msg,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=error_msg,
+            automation_runs_total.labels(platform=platform_name, outcome="failure").inc()
+            logger.error("worker.platform_create_failed", error=str(exc))
+            await _update_application_status(app_id, ApplicationStatus.FAILED, notes=error_msg)
+            await _broadcast_progress(app_id, ApplicationStatus.FAILED, detail=error_msg)
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_MANUAL,
+                idempotency_key=f"{app_id}:failed-platform-create",
+                step_name="submit_application",
+                error_message=error_msg,
             )
             return
         except Exception as exc:
             error_msg = f"Application submission failed: {exc}"
-            logger.error(
-                "worker.submit_failed",
-                app_id=app_id,
-                platform=platform_name,
-                error=str(exc),
-            )
+            automation_runs_total.labels(platform=platform_name, outcome="failure").inc()
+            logger.error("worker.submit_failed", app_id=app_id, platform=platform_name, error=str(exc))
             await _update_application_status(
                 app_id,
                 ApplicationStatus.FAILED,
                 notes=error_msg,
                 ats_score=ats_score,
             )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=error_msg,
+            await _broadcast_progress(app_id, ApplicationStatus.FAILED, detail=error_msg)
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_RETRYABLE,
+                idempotency_key=f"{app_id}:failed-submit",
+                step_name="submit_application",
+                error_message=error_msg,
             )
             return
 
@@ -385,6 +1131,13 @@ async def process_application(payload: dict[str, Any]) -> None:
             applied_at=datetime.now(UTC),
         )
         await _broadcast_progress(app_id, ApplicationStatus.APPLIED)
+        await _transition_workflow_state(
+            workflow_run_id,
+            WorkflowState.SUBMITTED,
+            idempotency_key=f"{app_id}:submitted",
+            step_name="submit_application",
+        )
+        automation_runs_total.labels(platform=platform_name, outcome="success").inc()
         logger.info(
             "worker.completed",
             job_id=job_id,
@@ -407,6 +1160,17 @@ async def process_application(payload: dict[str, Any]) -> None:
             ApplicationStatus.FAILED,
             detail=str(exc),
         )
+        try:
+            workflow_run_id, _ = await _ensure_workflow_run(app_id, job_id)
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_MANUAL,
+                idempotency_key=f"{app_id}:failed-auto-apply-error",
+                step_name="worker_error",
+                error_message=str(exc),
+            )
+        except Exception:
+            logger.warning("worker.workflow_failure_record_failed", app_id=app_id)
 
     except Exception as exc:
         logger.error(
@@ -425,6 +1189,17 @@ async def process_application(payload: dict[str, Any]) -> None:
             ApplicationStatus.FAILED,
             detail="Unexpected error during application",
         )
+        try:
+            workflow_run_id, _ = await _ensure_workflow_run(app_id, job_id)
+            await _transition_workflow_state(
+                workflow_run_id,
+                WorkflowState.FAILED_RETRYABLE,
+                idempotency_key=f"{app_id}:failed-unexpected-error",
+                step_name="worker_error",
+                error_message=str(exc),
+            )
+        except Exception:
+            logger.warning("worker.workflow_failure_record_failed", app_id=app_id)
 
 
 async def run_worker() -> None:
@@ -441,16 +1216,38 @@ async def run_worker() -> None:
         return
 
     logger.info("worker.started", queue=QUEUE_APPLY)
+    visibility_timeout_seconds = 180
 
     while True:
         try:
-            message = await dequeue(redis, QUEUE_APPLY, timeout=5)
+            message = await lease_message(
+                redis,
+                QUEUE_APPLY,
+                visibility_timeout_seconds=visibility_timeout_seconds,
+                timeout=5,
+            )
             if message is not None:
-                payload = message.get("payload", {})
-                await process_application(payload)
+                await process_apply_message(
+                    redis=redis,
+                    message=message,
+                    handler=process_application,
+                    queue_name=QUEUE_APPLY,
+                    visibility_timeout_seconds=visibility_timeout_seconds,
+                )
         except Exception as exc:
             logger.error("worker.loop_error", error=str(exc))
             await asyncio.sleep(1)
+
+
+async def _medium_risk_requires_review(tenant_id: str | None) -> bool:
+    if not tenant_id:
+        return True
+    async with async_session_factory() as db:
+        tenant = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalar_one_or_none()
+        if tenant is None or not isinstance(tenant.feature_overrides, dict):
+            return True
+        value = tenant.feature_overrides.get("medium_risk_requires_review")
+        return bool(value) if value is not None else True
 
 
 if __name__ == "__main__":

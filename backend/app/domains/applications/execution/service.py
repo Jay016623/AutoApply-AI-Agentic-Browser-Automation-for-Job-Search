@@ -1,0 +1,532 @@
+"""Durable execution service for application attempts."""
+
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import mimetypes
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.application_attempt import ApplicationAttempt
+from app.models.application_attempt_step import ApplicationAttemptStep
+from app.models.proof_artifact import ProofArtifact
+from app.services.artifacts import ArtifactStorage, get_artifact_storage
+from app.services.audit import AuditLogCreate, record_audit_log
+
+ATTEMPT_TERMINAL_STATES = {"completed", "failed_manual", "abandoned"}
+
+
+class ApplicationAttemptService:
+    """Persistence-focused service for resumable apply execution."""
+
+    def __init__(
+        self,
+        db: AsyncSession,
+        tenant_scope: str | None = None,
+        artifact_storage: ArtifactStorage | None = None,
+    ) -> None:
+        self._db = db
+        self._tenant_scope = tenant_scope
+        self._artifact_storage = artifact_storage or get_artifact_storage()
+
+    async def create_or_get_attempt(
+        self,
+        *,
+        tenant_id: str,
+        application_id: str,
+        workflow_run_id: str | None,
+        candidate_id: str | None,
+        job_id: str | None,
+        idempotency_key: str,
+    ) -> ApplicationAttempt:
+        result = await self._db.execute(
+            select(ApplicationAttempt).where(
+                ApplicationAttempt.application_id == application_id,
+                ApplicationAttempt.idempotency_key == idempotency_key,
+            ),
+        )
+        existing = result.scalar_one_or_none()
+        if existing is not None:
+            if self._tenant_scope and existing.tenant_id != self._tenant_scope:
+                raise PermissionError("cross_tenant_attempt_access_denied")
+            return existing
+
+        max_result = await self._db.execute(
+            select(func.max(ApplicationAttempt.attempt_number)).where(
+                ApplicationAttempt.application_id == application_id,
+            ),
+        )
+        max_attempt_number = max_result.scalar_one_or_none() or 0
+
+        attempt = ApplicationAttempt(
+            tenant_id=tenant_id,
+            application_id=application_id,
+            workflow_run_id=workflow_run_id,
+            candidate_id=candidate_id,
+            job_id=job_id,
+            status="pending",
+            current_step=None,
+            idempotency_key=idempotency_key,
+            attempt_number=max_attempt_number + 1,
+        )
+        self._db.add(attempt)
+        await self._db.commit()
+        await self._db.refresh(attempt)
+
+        await self._audit(
+            attempt,
+            "application_attempt_created",
+            message="Execution attempt created",
+        )
+        return attempt
+
+    async def start_attempt(self, attempt_id: str) -> ApplicationAttempt:
+        attempt = await self._get_attempt(attempt_id)
+        if attempt.status != "running":
+            attempt.status = "running"
+            attempt.started_at = attempt.started_at or datetime.now(UTC)
+            await self._db.commit()
+            await self._db.refresh(attempt)
+            await self._audit(attempt, "application_attempt_started", message="Execution started")
+        return attempt
+
+    async def record_step_started(
+        self,
+        *,
+        attempt_id: str,
+        step_name: str,
+        sequence_number: int,
+        idempotency_key: str,
+        input_snapshot_json: dict[str, Any] | None = None,
+    ) -> ApplicationAttemptStep:
+        existing = await self._get_step_by_key(attempt_id, idempotency_key)
+        if existing is not None:
+            return existing
+
+        step = ApplicationAttemptStep(
+            tenant_id=(await self._get_attempt(attempt_id)).tenant_id,
+            attempt_id=attempt_id,
+            step_name=step_name,
+            sequence_number=sequence_number,
+            status="running",
+            started_at=datetime.now(UTC),
+            idempotency_key=idempotency_key,
+            input_snapshot_json=input_snapshot_json,
+        )
+        self._db.add(step)
+
+        attempt = await self._get_attempt(attempt_id)
+        attempt.current_step = step_name
+        attempt.status = "running"
+
+        await self._db.commit()
+        await self._db.refresh(step)
+        await self._audit(
+            attempt,
+            "application_attempt_step_started",
+            message=f"Step started: {step_name}",
+            metadata={"sequence_number": sequence_number, "step_id": step.id},
+        )
+        return step
+
+    async def record_step_completed(
+        self,
+        *,
+        step_id: str,
+        output_snapshot_json: dict[str, Any] | None = None,
+    ) -> ApplicationAttemptStep:
+        step = await self._get_step(step_id)
+        step.status = "completed"
+        step.completed_at = datetime.now(UTC)
+        step.output_snapshot_json = output_snapshot_json
+        await self._db.commit()
+        await self._db.refresh(step)
+
+        attempt = await self._get_attempt(step.attempt_id)
+        await self._audit(
+            attempt,
+            "application_attempt_step_completed",
+            message=f"Step completed: {step.step_name}",
+            metadata={"step_id": step.id, "step_name": step.step_name},
+        )
+        return step
+
+    async def record_step_failed(
+        self,
+        *,
+        step_id: str,
+        error_code: str,
+        error_message: str,
+        retryable: bool,
+        manual_checkpoint_reason: str | None = None,
+    ) -> ApplicationAttemptStep:
+        step = await self._get_step(step_id)
+        step.status = "failed_retryable" if retryable else "failed_manual"
+        step.retryable = retryable
+        step.retry_count = step.retry_count + (1 if retryable else 0)
+        step.error_code = error_code
+        step.error_message = error_message
+        step.completed_at = datetime.now(UTC)
+
+        attempt = await self._get_attempt(step.attempt_id)
+        attempt.last_error_code = error_code
+        attempt.last_error_message = error_message
+        if manual_checkpoint_reason:
+            attempt.status = "waiting_manual"
+            attempt.manual_checkpoint_required = True
+            attempt.manual_checkpoint_reason = manual_checkpoint_reason
+        else:
+            attempt.status = "failed_retryable" if retryable else "failed_manual"
+        await self._db.commit()
+        await self._db.refresh(step)
+
+        await self._audit(
+            attempt,
+            "application_attempt_step_failed",
+            message=f"Step failed: {step.step_name}",
+            metadata={"step_id": step.id, "error_code": error_code, "retryable": retryable},
+        )
+        await self.store_structured_artifact(
+            tenant_id=attempt.tenant_id,
+            application_id=attempt.application_id,
+            workflow_run_id=attempt.workflow_run_id,
+            attempt_id=attempt.id,
+            attempt_step_id=step.id,
+            artifact_type="execution_failure",
+            payload={
+                "step_name": step.step_name,
+                "error_code": error_code,
+                "error_message": error_message,
+                "retryable": retryable,
+                "manual_checkpoint_reason": manual_checkpoint_reason,
+            },
+            metadata_json={"category": "failure_path"},
+        )
+
+        if manual_checkpoint_reason:
+            await self._audit(
+                attempt,
+                "application_attempt_waiting_manual",
+                message=manual_checkpoint_reason,
+            )
+        elif retryable:
+            await self._audit(
+                attempt,
+                "application_attempt_retry_scheduled",
+                message=f"Retry scheduled from step {step.step_name}",
+            )
+        return step
+
+    async def complete_attempt(self, attempt_id: str) -> ApplicationAttempt:
+        attempt = await self._get_attempt(attempt_id)
+        attempt.status = "completed"
+        attempt.completed_at = datetime.now(UTC)
+        attempt.next_retry_at = None
+        await self._db.commit()
+        await self._db.refresh(attempt)
+        await self._audit(attempt, "application_attempt_completed", message="Execution completed")
+        return attempt
+
+    async def abandon_attempt(self, attempt_id: str, reason: str) -> ApplicationAttempt:
+        attempt = await self._get_attempt(attempt_id)
+        attempt.status = "abandoned"
+        attempt.last_error_message = reason
+        attempt.completed_at = datetime.now(UTC)
+        await self._db.commit()
+        await self._db.refresh(attempt)
+        await self._audit(attempt, "application_attempt_abandoned", message=reason)
+        return attempt
+
+    async def schedule_retry(
+        self,
+        attempt_id: str,
+        *,
+        next_retry_at: datetime,
+        max_retries: int,
+    ) -> ApplicationAttempt:
+        attempt = await self._get_attempt(attempt_id)
+        if attempt.retry_count >= max_retries:
+            attempt.status = "waiting_manual"
+            attempt.manual_checkpoint_required = True
+            attempt.manual_checkpoint_reason = "retry_limit_exhausted"
+            attempt.next_retry_at = None
+            await self._db.commit()
+            await self._db.refresh(attempt)
+            await self._audit(
+                attempt,
+                "application_attempt_waiting_manual",
+                message="Retry limit exhausted; manual intervention required",
+            )
+            return attempt
+
+        attempt.retry_count = attempt.retry_count + 1
+        attempt.status = "retry_scheduled"
+        attempt.next_retry_at = next_retry_at
+        await self._db.commit()
+        await self._db.refresh(attempt)
+        await self._audit(
+            attempt,
+            "application_attempt_retry_scheduled",
+            message=f"Retry scheduled for {next_retry_at.isoformat()}",
+            metadata={"retry_count": attempt.retry_count},
+        )
+        return attempt
+
+    async def mark_retry_dispatched(self, attempt_id: str) -> ApplicationAttempt:
+        attempt = await self._get_attempt(attempt_id)
+        attempt.status = "running"
+        attempt.next_retry_at = None
+        await self._db.commit()
+        await self._db.refresh(attempt)
+        await self._audit(
+            attempt,
+            "application_attempt_started",
+            message="Retry dispatched to apply queue",
+            metadata={"retry_count": attempt.retry_count},
+        )
+        return attempt
+
+    async def record_risk_evaluation(
+        self,
+        attempt_id: str,
+        *,
+        risk_score: float,
+        confidence_score: float,
+        risk_level: str,
+        stage: str,
+        route_to_review: bool,
+        reason: str | None,
+    ) -> ApplicationAttempt:
+        attempt = await self._get_attempt(attempt_id)
+        attempt.risk_score = risk_score
+        attempt.confidence_score = confidence_score
+        attempt.risk_level = risk_level
+        await self._db.commit()
+        await self._db.refresh(attempt)
+
+        await self._audit(
+            attempt,
+            "risk_evaluated",
+            message=f"stage={stage} risk_level={risk_level}",
+            metadata={
+                "stage": stage,
+                "risk_score": risk_score,
+                "confidence_score": confidence_score,
+                "risk_level": risk_level,
+                "route_to_review": route_to_review,
+                "reason": reason,
+            },
+        )
+        if route_to_review:
+            await self._audit(
+                attempt,
+                "routed_to_review",
+                message=f"stage={stage} reason={reason or 'policy'}",
+                metadata={"stage": stage, "reason": reason, "risk_level": risk_level},
+            )
+        return attempt
+
+    async def create_proof_artifact(
+        self,
+        *,
+        tenant_id: str,
+        application_id: str | None,
+        workflow_run_id: str | None,
+        attempt_id: str | None,
+        attempt_step_id: str | None,
+        artifact_type: str,
+        storage_path: str,
+        checksum: str | None = None,
+        storage_backend: str = "local",
+        object_key: str | None = None,
+        bucket_name: str | None = None,
+        content_type: str | None = None,
+        size_bytes: int | None = None,
+        metadata_json: dict[str, Any] | None = None,
+    ) -> ProofArtifact:
+        artifact = ProofArtifact(
+            tenant_id=tenant_id,
+            application_id=application_id,
+            workflow_run_id=workflow_run_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            storage_path=storage_path,
+            checksum=checksum,
+            storage_backend=storage_backend,
+            object_key=object_key,
+            bucket_name=bucket_name,
+            content_type=content_type,
+            size_bytes=size_bytes,
+            metadata_json=metadata_json,
+        )
+        self._db.add(artifact)
+        await self._db.commit()
+        await self._db.refresh(artifact)
+        attempt = await self._get_attempt(attempt_id) if attempt_id else None
+        if attempt is not None:
+            await self._audit(
+                attempt,
+                "proof_artifact_created",
+                message=f"Artifact stored: {artifact_type}",
+                metadata={"artifact_id": artifact.id, "artifact_type": artifact_type},
+            )
+        return artifact
+
+    async def store_structured_artifact(
+        self,
+        *,
+        tenant_id: str,
+        application_id: str | None,
+        workflow_run_id: str | None,
+        attempt_id: str | None,
+        attempt_step_id: str | None,
+        artifact_type: str,
+        payload: dict[str, Any],
+        metadata_json: dict[str, Any] | None = None,
+    ) -> ProofArtifact:
+        stored = await self._artifact_storage.store_json(
+            tenant_id=tenant_id,
+            application_id=application_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            payload=payload,
+        )
+        merged_metadata = {
+            **(metadata_json or {}),
+            "storage_backend": stored.backend,
+            "object_key": stored.object_key,
+            "bucket_name": stored.bucket_name,
+            "size_bytes": stored.size_bytes,
+            "content_type": stored.content_type,
+        }
+        return await self.create_proof_artifact(
+            tenant_id=tenant_id,
+            application_id=application_id,
+            workflow_run_id=workflow_run_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            storage_path=stored.storage_path,
+            checksum=stored.checksum,
+            storage_backend=stored.backend,
+            object_key=stored.object_key,
+            bucket_name=stored.bucket_name,
+            content_type=stored.content_type,
+            size_bytes=stored.size_bytes,
+            metadata_json=merged_metadata,
+        )
+
+    async def store_file_artifact(
+        self,
+        *,
+        tenant_id: str,
+        application_id: str | None,
+        workflow_run_id: str | None,
+        attempt_id: str | None,
+        attempt_step_id: str | None,
+        artifact_type: str,
+        source_path: str,
+        metadata_json: dict[str, Any] | None = None,
+    ) -> ProofArtifact:
+        file_path = Path(source_path)
+        payload = file_path.read_bytes()
+        guessed_type, _ = mimetypes.guess_type(file_path.name)
+        extension = file_path.suffix.lstrip(".") or None
+        stored = await self._artifact_storage.store_bytes(
+            tenant_id=tenant_id,
+            application_id=application_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            payload=payload,
+            extension=extension,
+            content_type=guessed_type,
+        )
+        merged_metadata = {
+            **(metadata_json or {}),
+            "storage_backend": stored.backend,
+            "object_key": stored.object_key,
+            "bucket_name": stored.bucket_name,
+            "size_bytes": stored.size_bytes,
+            "content_type": stored.content_type,
+            "source_path": source_path,
+        }
+        return await self.create_proof_artifact(
+            tenant_id=tenant_id,
+            application_id=application_id,
+            workflow_run_id=workflow_run_id,
+            attempt_id=attempt_id,
+            attempt_step_id=attempt_step_id,
+            artifact_type=artifact_type,
+            storage_path=stored.storage_path,
+            checksum=stored.checksum,
+            storage_backend=stored.backend,
+            object_key=stored.object_key,
+            bucket_name=stored.bucket_name,
+            content_type=stored.content_type,
+            size_bytes=stored.size_bytes,
+            metadata_json=merged_metadata,
+        )
+
+    async def get_artifact_download_url(self, artifact: ProofArtifact, *, expires_in_seconds: int) -> str:
+        return await self._artifact_storage.get_temporary_download_url(
+            storage_path=artifact.storage_path,
+            object_key=artifact.object_key,
+            expires_in_seconds=expires_in_seconds,
+        )
+
+    async def get_resume_sequence(self, attempt_id: str) -> int:
+        result = await self._db.execute(
+            select(func.max(ApplicationAttemptStep.sequence_number)).where(
+                ApplicationAttemptStep.attempt_id == attempt_id,
+                ApplicationAttemptStep.status == "completed",
+            ),
+        )
+        return (result.scalar_one_or_none() or 0) + 1
+
+    async def _get_attempt(self, attempt_id: str) -> ApplicationAttempt:
+        query = select(ApplicationAttempt).where(ApplicationAttempt.id == attempt_id)
+        if self._tenant_scope:
+            query = query.where(ApplicationAttempt.tenant_id == self._tenant_scope)
+        result = await self._db.execute(query)
+        return result.scalar_one()
+
+    async def _get_step(self, step_id: str) -> ApplicationAttemptStep:
+        query = select(ApplicationAttemptStep).where(ApplicationAttemptStep.id == step_id)
+        result = await self._db.execute(query)
+        return result.scalar_one()
+
+    async def _get_step_by_key(self, attempt_id: str, idempotency_key: str) -> ApplicationAttemptStep | None:
+        result = await self._db.execute(
+            select(ApplicationAttemptStep).where(
+                ApplicationAttemptStep.attempt_id == attempt_id,
+                ApplicationAttemptStep.idempotency_key == idempotency_key,
+            ),
+        )
+        return result.scalar_one_or_none()
+
+    async def _audit(
+        self,
+        attempt: ApplicationAttempt,
+        event_type: str,
+        message: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        await record_audit_log(
+            self._db,
+            AuditLogCreate(
+                tenant_id=attempt.tenant_id,
+                actor_id=None,
+                actor_type="system",
+                entity_type="application_attempt",
+                entity_id=attempt.id,
+                event_type=event_type,
+                status=attempt.status,
+                message=message,
+                event_metadata=metadata,
+            ),
+        )

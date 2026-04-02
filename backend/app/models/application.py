@@ -15,7 +15,10 @@ class Application(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         Index("ix_application_status", "status"),
         Index("ix_application_job_id", "job_id"),
+        Index("ix_application_tenant", "tenant_id"),
     )
+
+    tenant_id: Mapped[str] = mapped_column(String(32), nullable=False)
 
     # Foreign keys
     job_id: Mapped[str] = mapped_column(
@@ -26,6 +29,11 @@ class Application(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     resume_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("resumes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    workflow_run_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"),
         nullable=True,
     )
 
@@ -50,6 +58,10 @@ class Application(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Relationships
     job: Mapped["Job"] = relationship(back_populates="applications")  # noqa: F821
     resume: Mapped["Resume | None"] = relationship(back_populates="applications")  # noqa: F821
+    attempts: Mapped[list["ApplicationAttempt"]] = relationship(  # noqa: F821
+        backref="application",
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
         return f"<Application(id={self.id}, job_id={self.job_id}, status='{self.status}')>"

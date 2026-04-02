@@ -1,4 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useTenantQueryScope } from '@/hooks/useTenantQueryScope';
 import * as resumeService from '@/services/resumeService';
 import type { ResumeGenerateRequest } from '@/types/resume';
 
@@ -6,8 +7,9 @@ const RESUMES_KEY = ['resumes'] as const;
 
 /** Fetch all resumes. */
 export function useResumes() {
+  const scope = useTenantQueryScope();
   return useQuery({
-    queryKey: [...RESUMES_KEY, 'list'],
+    queryKey: [...scope, ...RESUMES_KEY, 'list'],
     queryFn: () => resumeService.listResumes(),
   });
 }
@@ -15,10 +17,11 @@ export function useResumes() {
 /** Upload a resume file. */
 export function useUploadResume() {
   const queryClient = useQueryClient();
+  const scope = useTenantQueryScope();
   return useMutation({
     mutationFn: (file: File) => resumeService.uploadResume(file),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: RESUMES_KEY });
+      void queryClient.invalidateQueries({ queryKey: [...scope, ...RESUMES_KEY] });
     },
   });
 }
@@ -26,10 +29,11 @@ export function useUploadResume() {
 /** Generate a tailored resume. */
 export function useGenerateResume() {
   const queryClient = useQueryClient();
+  const scope = useTenantQueryScope();
   return useMutation({
     mutationFn: (request: ResumeGenerateRequest) => resumeService.generateResume(request),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: RESUMES_KEY });
+      void queryClient.invalidateQueries({ queryKey: [...scope, ...RESUMES_KEY] });
     },
   });
 }
@@ -45,10 +49,11 @@ export function useScoreResume() {
 /** Optimize a resume for ATS. */
 export function useOptimizeResume() {
   const queryClient = useQueryClient();
+  const scope = useTenantQueryScope();
   return useMutation({
     mutationFn: (resumeId: string) => resumeService.optimizeResume(resumeId),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: RESUMES_KEY });
+      void queryClient.invalidateQueries({ queryKey: [...scope, ...RESUMES_KEY] });
     },
   });
 }

@@ -1,4 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useTenantQueryScope } from '@/hooks/useTenantQueryScope';
 import * as settingsService from '@/services/settingsService';
 import type { SettingsUpdate } from '@/types/settings';
 
@@ -6,8 +7,9 @@ const SETTINGS_KEY = ['settings'] as const;
 
 /** Fetch current user settings. */
 export function useSettings() {
+  const scope = useTenantQueryScope();
   return useQuery({
-    queryKey: [...SETTINGS_KEY, 'current'],
+    queryKey: [...scope, ...SETTINGS_KEY, 'current'],
     queryFn: () => settingsService.getSettings(),
   });
 }
@@ -15,18 +17,20 @@ export function useSettings() {
 /** Update user settings. */
 export function useUpdateSettings() {
   const queryClient = useQueryClient();
+  const scope = useTenantQueryScope();
   return useMutation({
     mutationFn: (update: SettingsUpdate) => settingsService.updateSettings(update),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
+      void queryClient.invalidateQueries({ queryKey: [...scope, ...SETTINGS_KEY] });
     },
   });
 }
 
 /** Fetch LLM provider statuses. */
 export function useLLMProviders() {
+  const scope = useTenantQueryScope();
   return useQuery({
-    queryKey: [...SETTINGS_KEY, 'llm-providers'],
+    queryKey: [...scope, ...SETTINGS_KEY, 'llm-providers'],
     queryFn: () => settingsService.getLLMProviders(),
   });
 }
