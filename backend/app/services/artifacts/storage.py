@@ -58,6 +58,7 @@ class ArtifactStorage:
         self,
         *,
         tenant_id: str | None,
+        application_id: str | None,
         attempt_id: str | None,
         attempt_step_id: str | None,
         artifact_type: str,
@@ -71,6 +72,7 @@ class ArtifactStorage:
         self,
         *,
         tenant_id: str | None,
+        application_id: str | None,
         attempt_id: str | None,
         attempt_step_id: str | None,
         artifact_type: str,
@@ -79,6 +81,7 @@ class ArtifactStorage:
         data = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
         return await self.store_bytes(
             tenant_id=tenant_id,
+            application_id=application_id,
             attempt_id=attempt_id,
             attempt_step_id=attempt_step_id,
             artifact_type=artifact_type,
@@ -100,6 +103,7 @@ class ArtifactStorage:
         self,
         *,
         tenant_id: str | None,
+        application_id: str | None,
         attempt_id: str | None,
         attempt_step_id: str | None,
         artifact_type: str,
@@ -108,14 +112,15 @@ class ArtifactStorage:
     ) -> str:
         now = datetime.now(UTC)
         safe_tenant = _safe_segment(tenant_id, default="tenant-unknown")
+        safe_application = _safe_segment(application_id, default="application-unknown")
         safe_attempt = _safe_segment(attempt_id, default="attempt-unknown")
         safe_step = _safe_segment(attempt_step_id, default="step-global")
         safe_type = _safe_segment(artifact_type, default="artifact")
         safe_ext = _normalize_extension(extension, content_type)
         return (
-            f"tenant={safe_tenant}/year={now:%Y}/month={now:%m}/day={now:%d}/"
-            f"attempt={safe_attempt}/step={safe_step}/{safe_type}/"
-            f"{now:%Y%m%dT%H%M%S%fZ}.{safe_ext}"
+            f"tenant_id={safe_tenant}/application_id={safe_application}/attempt_id={safe_attempt}/"
+            f"step_id={safe_step}/artifact_type={safe_type}/"
+            f"timestamp={now:%Y%m%dT%H%M%S%fZ}.{safe_ext}"
         )
 
 
@@ -142,6 +147,7 @@ class LocalArtifactStorage(ArtifactStorage):
         self,
         *,
         tenant_id: str | None,
+        application_id: str | None,
         attempt_id: str | None,
         attempt_step_id: str | None,
         artifact_type: str,
@@ -160,6 +166,7 @@ class LocalArtifactStorage(ArtifactStorage):
                 )
         object_key = self.build_object_key(
             tenant_id=tenant_id,
+            application_id=application_id,
             attempt_id=attempt_id,
             attempt_step_id=attempt_step_id,
             artifact_type=artifact_type,
@@ -228,6 +235,7 @@ class S3ArtifactStorage(ArtifactStorage):
         self,
         *,
         tenant_id: str | None,
+        application_id: str | None,
         attempt_id: str | None,
         attempt_step_id: str | None,
         artifact_type: str,
@@ -246,6 +254,7 @@ class S3ArtifactStorage(ArtifactStorage):
                 )
         object_key = self.build_object_key(
             tenant_id=tenant_id,
+            application_id=application_id,
             attempt_id=attempt_id,
             attempt_step_id=attempt_step_id,
             artifact_type=artifact_type,

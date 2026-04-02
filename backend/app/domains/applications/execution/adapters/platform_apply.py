@@ -191,7 +191,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
         artifacts = [
             ArtifactRecord(
                 artifact_type="trace",
-                storage_path=f"attempt://adapter/{self.capability.adapter_name}/trace",
+                storage_path=f"adapter://{self.capability.adapter_name}/trace",
                 metadata={
                     "platform": result.metadata.get("platform", "unknown"),
                     "success": result.success,
@@ -200,12 +200,12 @@ class PlatformApplyAdapter(ExecutionAdapter):
             ),
             ArtifactRecord(
                 artifact_type="verification_evidence",
-                storage_path=f"attempt://adapter/{self.capability.adapter_name}/verification",
+                storage_path=f"adapter://{self.capability.adapter_name}/verification",
                 metadata=verification_evidence,
             ),
             ArtifactRecord(
                 artifact_type="verification_bundle",
-                storage_path=f"attempt://adapter/{self.capability.adapter_name}/verification_bundle",
+                storage_path=f"adapter://{self.capability.adapter_name}/verification_bundle",
                 metadata={
                     "platform": result.metadata.get("platform", "unknown"),
                     "evidence_keys": sorted(list(verification_evidence.keys())),
@@ -219,7 +219,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
             artifacts.append(
                 ArtifactRecord(
                     artifact_type="screenshot",
-                    storage_path=f"attempt://adapter/{self.capability.adapter_name}/screenshot",
+                    storage_path=f"adapter://{self.capability.adapter_name}/screenshot",
                     metadata={"path": verification_evidence.get("screenshot_path")},
                 ),
             )
@@ -227,7 +227,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
             artifacts.append(
                 ArtifactRecord(
                     artifact_type="dom_snapshot",
-                    storage_path=f"attempt://adapter/{self.capability.adapter_name}/dom_snapshot",
+                    storage_path=f"adapter://{self.capability.adapter_name}/dom_snapshot",
                     metadata={"path": verification_evidence.get("dom_snapshot_path")},
                 ),
             )
@@ -235,7 +235,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
             artifacts.append(
                 ArtifactRecord(
                     artifact_type="execution_log",
-                    storage_path=f"attempt://adapter/{self.capability.adapter_name}/execution_log",
+                    storage_path=f"adapter://{self.capability.adapter_name}/execution_log",
                     metadata={"log": verification_evidence.get("execution_log")},
                 ),
             )
@@ -243,7 +243,7 @@ class PlatformApplyAdapter(ExecutionAdapter):
             artifacts.append(
                 ArtifactRecord(
                     artifact_type="log",
-                    storage_path=f"attempt://adapter/{self.capability.adapter_name}/failure",
+                    storage_path=f"adapter://{self.capability.adapter_name}/failure",
                     metadata={"error_code": result.error_code, "error_message": result.error_message or ""},
                 ),
             )

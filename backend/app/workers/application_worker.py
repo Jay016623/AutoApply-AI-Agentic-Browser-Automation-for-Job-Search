@@ -251,7 +251,41 @@ async def _execute_attempt_path(
                     verification_hints=payload.get("verification_evidence", {}) or {},
                 )
                 prepared_context = await adapter.prepare(exec_context)
+                await attempt_service.store_structured_artifact(
+                    tenant_id=tenant_id,
+                    application_id=app_id,
+                    workflow_run_id=workflow_run_id,
+                    attempt_id=attempt.id,
+                    attempt_step_id=step.id,
+                    artifact_type="execution_request",
+                    payload={
+                        "platform": platform_name,
+                        "job_id": job.id,
+                        "application_id": app_id,
+                        "workflow_run_id": workflow_run_id,
+                        "manual_checkpoint_mode": bool(payload.get("manual_checkpoint_mode")),
+                    },
+                    metadata_json={"category": "request_payload"},
+                )
                 adapter_result = await adapter.execute(prepared_context)
+                await attempt_service.store_structured_artifact(
+                    tenant_id=tenant_id,
+                    application_id=app_id,
+                    workflow_run_id=workflow_run_id,
+                    attempt_id=attempt.id,
+                    attempt_step_id=step.id,
+                    artifact_type="execution_response",
+                    payload={
+                        "success": bool(adapter_result.success),
+                        "error_code": adapter_result.error_code,
+                        "error_message": adapter_result.error_message,
+                        "failure_category": (
+                            adapter_result.failure_category.value if adapter_result.failure_category else None
+                        ),
+                        "submission_url": adapter_result.submission_url,
+                    },
+                    metadata_json={"category": "response_payload"},
+                )
                 failure_class = adapter.classify_failure(adapter_result)
                 if failure_class != AdapterFailureClass.NONE:
                     retryable = failure_class == AdapterFailureClass.RETRYABLE

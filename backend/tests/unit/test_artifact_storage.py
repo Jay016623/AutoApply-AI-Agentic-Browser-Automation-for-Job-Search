@@ -11,6 +11,7 @@ class TestLocalArtifactStorage:
 
         stored = await storage.store_json(
             tenant_id="tenant-1",
+            application_id="application-1",
             attempt_id="attempt-1",
             attempt_step_id="step-1",
             artifact_type="verification_evidence",
@@ -22,7 +23,7 @@ class TestLocalArtifactStorage:
         assert stored.size_bytes > 0
         assert stored.object_key
         assert file_path.exists()
-        assert "tenant=tenant-1" in stored.storage_path
+        assert "tenant_id=tenant-1" in stored.storage_path
 
 
 class _FakeS3Client:
@@ -51,6 +52,7 @@ class TestS3ArtifactStorage:
 
         stored = await storage.store_bytes(
             tenant_id="tenant-a",
+            application_id="application-b",
             attempt_id="attempt-b",
             attempt_step_id="step-c",
             artifact_type="screenshot",

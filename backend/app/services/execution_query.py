@@ -1,6 +1,7 @@
 """Tenant-scoped read surfaces for execution visibility."""
 
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -162,14 +163,58 @@ async def get_artifact_download_url(db: AsyncSession, auth: AuthContext, artifac
         raise RecordNotFoundError("ProofArtifact", artifact_id)
 
     settings = get_settings()
-    storage = get_artifact_storage()
     expires = settings.artifact_storage_presign_ttl_seconds
-    url = await storage.get_temporary_download_url(
-        storage_path=row.storage_path,
-        object_key=row.object_key,
-        expires_in_seconds=expires,
-    )
+    if row.storage_path.startswith(("attempt://", "adapter://")):
+        legacy_path = (row.metadata_json or {}).get("captured_path") if isinstance(row.metadata_json, dict) else None
+        if isinstance(legacy_path, str) and Path(legacy_path).exists():
+            url = legacy_path
+        else:
+            url = row.storage_path
+    else:
+        storage = get_artifact_storage()
+        url = await storage.get_temporary_download_url(
+            storage_path=row.storage_path,
+            object_key=row.object_key,
+            expires_in_seconds=expires,
+        )
     return ArtifactDownloadUrlResponse(artifact_id=row.id, expires_in_seconds=expires, url=url)
+
+
+async def list_step_artifacts(
+    db: AsyncSession,
+    auth: AuthContext,
+    attempt_step_id: str,
+    *,
+    page: int = 1,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    artifact_type: str | None = None,
+) -> ProofArtifactListResponse:
+    ensure_role(auth, _READ_ROLES)
+    page_size = min(page_size, MAX_PAGE_SIZE)
+    offset = (page - 1) * page_size
+
+    query = select(ProofArtifact).where(ProofArtifact.attempt_step_id == attempt_step_id)
+    count_query = select(func.count(ProofArtifact.id)).where(ProofArtifact.attempt_step_id == attempt_step_id)
+    if artifact_type:
+        query = query.where(ProofArtifact.artifact_type == artifact_type)
+        count_query = count_query.where(ProofArtifact.artifact_type == artifact_type)
+    if auth.enforced:
+        tenant_id = require_tenant(auth)
+        query = query.where(ProofArtifact.tenant_id == tenant_id)
+        count_query = count_query.where(ProofArtifact.tenant_id == tenant_id)
+    elif auth.tenant_id:
+        query = query.where(ProofArtifact.tenant_id == auth.tenant_id)
+        count_query = count_query.where(ProofArtifact.tenant_id == auth.tenant_id)
+
+    rows = (await db.execute(query.order_by(ProofArtifact.created_at.desc()).offset(offset).limit(page_size))).scalars().all()
+    total = int((await db.execute(count_query)).scalar() or 0)
+    return ProofArtifactListResponse(
+        items=[ProofArtifactResponse.model_validate(r) for r in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+        has_next=(page * page_size) < total,
+    )
 
 
 async def list_manual_queue(

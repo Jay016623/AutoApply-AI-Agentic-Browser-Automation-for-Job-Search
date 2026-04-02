@@ -188,6 +188,22 @@ class ApplicationAttemptService:
             message=f"Step failed: {step.step_name}",
             metadata={"step_id": step.id, "error_code": error_code, "retryable": retryable},
         )
+        await self.store_structured_artifact(
+            tenant_id=attempt.tenant_id,
+            application_id=attempt.application_id,
+            workflow_run_id=attempt.workflow_run_id,
+            attempt_id=attempt.id,
+            attempt_step_id=step.id,
+            artifact_type="execution_failure",
+            payload={
+                "step_name": step.step_name,
+                "error_code": error_code,
+                "error_message": error_message,
+                "retryable": retryable,
+                "manual_checkpoint_reason": manual_checkpoint_reason,
+            },
+            metadata_json={"category": "failure_path"},
+        )
 
         if manual_checkpoint_reason:
             await self._audit(
@@ -333,6 +349,7 @@ class ApplicationAttemptService:
     ) -> ProofArtifact:
         stored = await self._artifact_storage.store_json(
             tenant_id=tenant_id,
+            application_id=application_id,
             attempt_id=attempt_id,
             attempt_step_id=attempt_step_id,
             artifact_type=artifact_type,
@@ -381,6 +398,7 @@ class ApplicationAttemptService:
         extension = file_path.suffix.lstrip(".") or None
         stored = await self._artifact_storage.store_bytes(
             tenant_id=tenant_id,
+            application_id=application_id,
             attempt_id=attempt_id,
             attempt_step_id=attempt_step_id,
             artifact_type=artifact_type,
