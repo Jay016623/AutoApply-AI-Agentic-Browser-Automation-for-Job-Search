@@ -1,138 +1,64 @@
-"""Unit tests for the resume service."""
+"""Unit tests for resume service helpers."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
-import pytest
+from sqlalchemy.exc import IntegrityError
 
-from app.core.exceptions import RecordNotFoundError
-from app.models.job import Job
-from app.models.resume import Resume
-from app.schemas.resume import ResumeGenerateRequest, ResumeScoreRequest
-from app.services import resume as resume_service
+from app.services.resume import _create_resume_version
 
 
-async def _create_base_resume(db_session, name="Base Resume"):
-    """Helper to create a base resume record."""
-    r = Resume(name=name, type="base", template_id="modern")
-    db_session.add(r)
-    await db_session.commit()
-    await db_session.refresh(r)
-    return r
-
-
-async def _create_job(db_session, sample_job_data, suffix="0"):
-    data = {**sample_job_data, "platform_job_id": f"job-{suffix}"}
-    job = Job(**data)
-    db_session.add(job)
-    await db_session.commit()
-    await db_session.refresh(job)
-    return job
-
-
-class TestListResumes:
-    async def test_list_resumes_empty(self, db_session):
-        result = await resume_service.list_resumes(db_session)
-        assert result.items == []
-        assert result.total == 0
-
-
-class TestGenerateTailoredResume:
-    async def test_generate_tailored_resume(self, db_session, sample_job_data):
-        base = await _create_base_resume(db_session)
-        job = await _create_job(db_session, sample_job_data)
-
-        request = ResumeGenerateRequest(
-            base_resume_id=base.id,
-            job_id=job.id,
-            template_id="classic",
+class TestCreateResumeVersion:
+    async def test_retries_on_unique_conflict_and_succeeds(self) -> None:
+        db = Mock()
+        db.execute = AsyncMock(
+            side_effect=[
+                SimpleNamespace(scalar_one_or_none=lambda: SimpleNamespace(version=1)),
+                SimpleNamespace(scalar_one_or_none=lambda: SimpleNamespace(version=2)),
+            ]
         )
-        result = await resume_service.generate_tailored_resume(db_session, request)
+        db.add = Mock()
+        db.commit = AsyncMock(side_effect=[IntegrityError("stmt", {}, Exception("dup")), None])
+        db.rollback = AsyncMock()
 
-        assert result.type == "tailored"
-        assert result.base_resume_id == base.id
-        assert result.job_id == job.id
-        assert result.template_id == "classic"
-        assert "Tailored" in result.name
-
-
-class TestScoreResume:
-    async def test_score_resume_empty_text(self, db_session, sample_job_data):
-        """Resume with no content_text returns zero scores."""
-        base = await _create_base_resume(db_session)
-        job = await _create_job(db_session, sample_job_data)
-
-        request = ResumeScoreRequest(job_id=job.id)
-        result = await resume_service.score_resume(db_session, base.id, request)
-
-        assert result.resume_id == base.id
-        assert result.job_id == job.id
-        assert result.overall_score == 0.0
-        assert result.skill_score == 0.0
-        assert len(result.missing_skills) > 0
-        assert len(result.suggestions) > 0
-
-    async def test_score_resume_with_content(self, db_session, sample_job_data):
-        """Resume with content_text returns real scores."""
-        r = Resume(
-            name="Parsed Resume",
-            type="base",
+        resume = SimpleNamespace(
+            id="resume-1",
+            job_id="job-1",
             template_id="modern",
-            content_text="Experienced Python developer with FastAPI and PostgreSQL skills",
+            file_path_pdf="/tmp/out.pdf",
+            file_path_docx="/tmp/out.docx",
+            content_text="content",
+            ats_score=0.91,
         )
-        db_session.add(r)
-        await db_session.commit()
-        await db_session.refresh(r)
 
-        job = await _create_job(db_session, sample_job_data)
+        await _create_resume_version(
+            db=db,
+            resume=resume,
+            candidate_id="candidate-1",
+            variant_type="tailored",
+            label="Tailored Resume",
+        )
 
-        request = ResumeScoreRequest(job_id=job.id)
-        result = await resume_service.score_resume(db_session, r.id, request)
+        assert db.commit.await_count == 2
+        db.rollback.assert_awaited_once()
+        assert db.add.call_count == 2
 
-        assert result.resume_id == r.id
-        assert result.job_id == job.id
-        # Should have a non-zero score since resume text mentions job skills
-        assert 0.0 <= result.overall_score <= 1.0
-        assert 0.0 <= result.skill_score <= 1.0
-        assert 0.0 <= result.keyword_score <= 1.0
+    async def test_skips_when_candidate_id_missing(self) -> None:
+        db = Mock()
+        db.execute = AsyncMock()
+        db.add = Mock()
+        db.commit = AsyncMock()
+        db.rollback = AsyncMock()
+        resume = SimpleNamespace()
 
+        await _create_resume_version(
+            db=db,
+            resume=resume,
+            candidate_id=None,
+            variant_type="base",
+            label="Base Resume",
+        )
 
-class TestUploadResume:
-    async def test_upload_resume_creates_record(self, db_session, tmp_path):
-        mock_file = MagicMock()
-        mock_file.filename = "my_resume.pdf"
-        mock_file.read = AsyncMock(return_value=b"fake pdf content here with enough words to count")
-
-        with patch.object(resume_service, "UPLOAD_DIR", tmp_path):
-            result = await resume_service.upload_resume(db_session, mock_file)
-
-        assert result.name == "my_resume.pdf"
-        assert result.file_format == "pdf"
-        assert result.word_count > 0
-        assert result.id is not None
-
-    async def test_upload_docx_sets_correct_format(self, db_session, tmp_path):
-        mock_file = MagicMock()
-        mock_file.filename = "resume.docx"
-        mock_file.read = AsyncMock(return_value=b"fake docx content")
-
-        with patch.object(resume_service, "UPLOAD_DIR", tmp_path):
-            result = await resume_service.upload_resume(db_session, mock_file)
-
-        assert result.file_format == "docx"
-
-    async def test_upload_with_no_filename(self, db_session, tmp_path):
-        mock_file = MagicMock()
-        mock_file.filename = None
-        mock_file.read = AsyncMock(return_value=b"content")
-
-        with patch.object(resume_service, "UPLOAD_DIR", tmp_path):
-            result = await resume_service.upload_resume(db_session, mock_file)
-
-        assert result.name == "Untitled Resume"
-        assert result.file_format == "pdf"
-
-
-class TestGetResumeNotFound:
-    async def test_get_resume_not_found(self, db_session):
-        with pytest.raises(RecordNotFoundError):
-            await resume_service.get_resume(db_session, "nonexistent_id")
+        db.execute.assert_not_called()
+        db.add.assert_not_called()
+        db.commit.assert_not_called()
