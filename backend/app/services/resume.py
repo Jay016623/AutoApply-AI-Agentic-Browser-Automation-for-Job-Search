@@ -11,6 +11,7 @@ from pathlib import Path
 import structlog
 from fastapi import UploadFile
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.documents.generator import DocumentGenerator
@@ -406,31 +407,43 @@ async def _create_resume_version(
     if not candidate_id:
         return
 
-    result = await db.execute(
-        select(ResumeVersion)
-        .where(ResumeVersion.candidate_id == candidate_id)
-        .order_by(ResumeVersion.version.desc())
-        .limit(1),
-    )
-    latest = result.scalar_one_or_none()
-    next_version = (latest.version + 1) if latest is not None else 1
+    max_attempts = 3
+    for _attempt in range(max_attempts):
+        result = await db.execute(
+            select(ResumeVersion)
+            .where(ResumeVersion.candidate_id == candidate_id)
+            .order_by(ResumeVersion.version.desc())
+            .limit(1),
+        )
+        latest = result.scalar_one_or_none()
+        next_version = (latest.version + 1) if latest is not None else 1
 
-    version = ResumeVersion(
-        tenant_id=None,
-        candidate_id=candidate_id,
-        resume_id=resume.id,
-        job_id=resume.job_id,
-        version=next_version,
-        label=label,
-        template_id=resume.template_id,
-        variant_type=variant_type,
-        file_path_pdf=resume.file_path_pdf,
-        file_path_docx=resume.file_path_docx,
-        content_text=resume.content_text,
-        ats_score=resume.ats_score,
+        version = ResumeVersion(
+            tenant_id=None,
+            candidate_id=candidate_id,
+            resume_id=resume.id,
+            job_id=resume.job_id,
+            version=next_version,
+            label=label,
+            template_id=resume.template_id,
+            variant_type=variant_type,
+            file_path_pdf=resume.file_path_pdf,
+            file_path_docx=resume.file_path_docx,
+            content_text=resume.content_text,
+            ats_score=resume.ats_score,
+        )
+        db.add(version)
+        try:
+            await db.commit()
+            return
+        except IntegrityError:
+            await db.rollback()
+
+    msg = (
+        f"Failed to assign a unique resume version for candidate '{candidate_id}' "
+        f"after {max_attempts} attempts."
     )
-    db.add(version)
-    await db.commit()
+    raise RuntimeError(msg)
 
 
 async def score_resume(

@@ -3,7 +3,7 @@
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
-from fastapi import Header
+from fastapi import Header, HTTPException, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,8 +46,14 @@ async def get_tenant_context(
     """
     settings = get_settings()
     enforced = settings.feature_flags.tenant_enforcement
+    normalized_tenant_id = x_tenant_id.strip() if x_tenant_id else None
+    if enforced and not normalized_tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-Tenant-Id header is required when tenant enforcement is enabled.",
+        )
     return TenantContext(
-        tenant_id=x_tenant_id,
+        tenant_id=normalized_tenant_id,
         actor_id=x_actor_id,
         enforced=enforced,
     )
