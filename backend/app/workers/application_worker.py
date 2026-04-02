@@ -35,6 +35,7 @@ from app.observability.metrics import automation_runs_total
 from app.schemas.resume import ResumeGenerateRequest
 from app.schemas.review import ReviewTaskCreate
 from app.services import resume as resume_service, review_queue
+from app.services import control_plane
 from app.services.queue import dequeue
 from app.workers.orchestration import process_apply_message
 
@@ -783,6 +784,29 @@ async def process_application(payload: dict[str, Any]) -> None:
         # Step 4: Apply via platform
         # --------------------------------------------------------------
         await _broadcast_progress(app_id, "submitting")
+        if job.tenant_id:
+            async with async_session_factory() as quota_db:
+                try:
+                    await control_plane.enforce_quota(
+                        quota_db,
+                        tenant_id=job.tenant_id,
+                        quota_key="automation_concurrency",
+                        increment=1,
+                        context={"operation": "worker_submit", "application_id": app_id},
+                    )
+                except control_plane.QuotaExceededError as exc:
+                    quota_message = f"Automation concurrency quota exceeded: {exc}"
+                    await _update_application_status(app_id, ApplicationStatus.FAILED, notes=quota_message, ats_score=ats_score)
+                    await _broadcast_progress(app_id, ApplicationStatus.FAILED, detail=quota_message)
+                    await _create_review_task(
+                        tenant_id=job.tenant_id,
+                        application_id=app_id,
+                        workflow_run_id=workflow_run_id,
+                        reason="uncertain_submission",
+                        details={"quota": "automation_concurrency", "message": quota_message},
+                        idempotency_key=f"{app_id}:review:quota:automation-concurrency",
+                    )
+                    return
         if not _state_reached(workflow_state, WorkflowState.APPLYING):
             workflow_state = await _transition_workflow_state(
                 workflow_run_id,

@@ -379,7 +379,7 @@ async def generate_tailored_resume(
     resume_data = _build_resume_data_from_text(base.content_text or "")
 
     # Generate via DocumentGenerator (LLM tailoring + rendering)
-    llm = LLMClient()
+    llm = LLMClient(tenant_id=base.tenant_id)
     generator = DocumentGenerator(llm_client=llm)
     doc = await generator.generate_resume(
         resume_data=resume_data,
@@ -699,7 +699,7 @@ async def optimize_resume(
     )
     from app.core.llm.prompts.resume_tailor import TailoredResumeData
 
-    llm = LLMClient()
+    llm = LLMClient(tenant_id=resume.tenant_id)
     prompt = render_ats_optimize_prompt(
         resume_text, job_description, score_breakdown, suggestions,
     )

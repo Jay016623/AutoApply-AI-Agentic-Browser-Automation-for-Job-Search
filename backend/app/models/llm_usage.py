@@ -1,6 +1,6 @@
 """LLM usage tracking database model."""
 
-from sqlalchemy import Float, Integer, String
+from sqlalchemy import Float, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -10,6 +10,11 @@ class LLMUsage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Record of a single LLM API call for cost and usage tracking."""
 
     __tablename__ = "llm_usage"
+    __table_args__ = (
+        Index("ix_llm_usage_tenant_created", "tenant_id", "created_at"),
+    )
+
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Provider info
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -32,6 +37,6 @@ class LLMUsage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     def __repr__(self) -> str:
         return (
-            f"<LLMUsage(provider='{self.provider}', model='{self.model}', "
+            f"<LLMUsage(tenant_id='{self.tenant_id}', provider='{self.provider}', model='{self.model}', "
             f"tokens={self.total_tokens}, cost=${self.cost_usd:.6f})>"
         )

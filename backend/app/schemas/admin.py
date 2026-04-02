@@ -43,6 +43,19 @@ class OpsDiagnosticsResponse(BaseModel):
     strict_startup_validation: bool
 
 
+class TenantPlanUpdateRequest(BaseModel):
+    plan_key: str
+    plan_overrides: dict | None = None
+    feature_overrides: dict | None = None
+
+
+class TenantControlPlaneStatusResponse(BaseModel):
+    tenant_id: str
+    plan_key: str
+    features: dict[str, bool]
+    quotas: dict[str, dict[str, float | bool]]
+
+
 class SessionBootstrapRequest(BaseModel):
     """Session bootstrap request used to mint a principal token."""
 

@@ -19,8 +19,10 @@ from app.schemas.admin import (
     SessionBootstrapRequest,
     SessionBootstrapResponse,
     SystemHealthResponse,
+    TenantControlPlaneStatusResponse,
+    TenantPlanUpdateRequest,
 )
-from app.services import ops_diagnostics
+from app.services import control_plane, ops_diagnostics
 from app.services.queue import get_queue_depth
 
 router = APIRouter()
@@ -111,6 +113,16 @@ async def diagnostics(
 ) -> OpsDiagnosticsResponse:
     """Return queue and workflow pressure diagnostics for incident response."""
     ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.OPERATOR, Role.READ_ONLY})
+    if auth.tenant_id:
+        try:
+            await control_plane.require_feature(
+                db,
+                tenant_id=auth.tenant_id,
+                feature_key="advanced_execution_diagnostics",
+                actor_id=auth.user_id,
+            )
+        except control_plane.QuotaExceededError as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
     settings = get_settings()
     return OpsDiagnosticsResponse(
         queue_depths=await ops_diagnostics.queue_depth_snapshot(redis),
@@ -118,6 +130,37 @@ async def diagnostics(
         tenant_enforcement=settings.strict_tenant_enforcement,
         strict_startup_validation=settings.feature_flags.strict_tenant_startup_validation,
     )
+
+
+@router.get("/control/plan", response_model=TenantControlPlaneStatusResponse, summary="Current tenant plan + quota status")
+async def current_tenant_plan_status(
+    db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+) -> TenantControlPlaneStatusResponse:
+    """Return plan, feature flags, and quota usage for the authenticated tenant."""
+    ensure_role(auth, {Role.OWNER, Role.ADMIN, Role.OPERATOR, Role.READ_ONLY, Role.RECRUITER})
+    status_payload = await control_plane.get_current_tenant_quota_status(db, auth)
+    return TenantControlPlaneStatusResponse.model_validate(status_payload)
+
+
+@router.put("/control/tenants/{tenant_id}/plan", response_model=TenantControlPlaneStatusResponse, summary="Update tenant plan")
+async def update_tenant_plan(
+    tenant_id: str,
+    payload: TenantPlanUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(get_auth_context),
+) -> TenantControlPlaneStatusResponse:
+    """Update plan key and optional override maps for a tenant (owner/admin only)."""
+    await control_plane.update_tenant_plan(
+        db,
+        tenant_id=tenant_id,
+        plan_key=payload.plan_key,
+        plan_overrides=payload.plan_overrides,
+        feature_overrides=payload.feature_overrides,
+        auth=auth,
+    )
+    status_payload = await control_plane.get_tenant_quota_status(db, tenant_id)
+    return TenantControlPlaneStatusResponse.model_validate(status_payload)
 
 
 @router.post("/session/bootstrap", response_model=SessionBootstrapResponse, summary="Bootstrap session token")

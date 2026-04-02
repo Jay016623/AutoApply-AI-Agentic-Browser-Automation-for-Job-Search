@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from app.config.settings import get_settings
+from app.db.session import async_session_factory
 from app.observability.metrics import artifact_storage_bytes_total
+from app.services import control_plane
 
 _SAFE_SEGMENT_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
 
@@ -147,6 +149,15 @@ class LocalArtifactStorage(ArtifactStorage):
         extension: str | None = None,
         content_type: str | None = None,
     ) -> StoredArtifact:
+        if tenant_id:
+            async with async_session_factory() as db:
+                await control_plane.enforce_quota(
+                    db,
+                    tenant_id=tenant_id,
+                    quota_key="artifact_storage_bytes",
+                    increment=float(len(payload)),
+                    context={"operation": "artifact_store", "backend": self.backend_name, "artifact_type": artifact_type},
+                )
         object_key = self.build_object_key(
             tenant_id=tenant_id,
             attempt_id=attempt_id,
@@ -224,6 +235,15 @@ class S3ArtifactStorage(ArtifactStorage):
         extension: str | None = None,
         content_type: str | None = None,
     ) -> StoredArtifact:
+        if tenant_id:
+            async with async_session_factory() as db:
+                await control_plane.enforce_quota(
+                    db,
+                    tenant_id=tenant_id,
+                    quota_key="artifact_storage_bytes",
+                    increment=float(len(payload)),
+                    context={"operation": "artifact_store", "backend": self.backend_name, "artifact_type": artifact_type},
+                )
         object_key = self.build_object_key(
             tenant_id=tenant_id,
             attempt_id=attempt_id,

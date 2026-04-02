@@ -6,6 +6,7 @@ Handles creating, listing, approving, and updating job applications.
 from datetime import UTC, datetime
 
 import structlog
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +16,7 @@ from app.core.auth import AuthContext, Role, ensure_role, ensure_tenant_access, 
 from app.core.exceptions import RecordNotFoundError
 from app.models.application import Application
 from app.models.job import Job
+from app.services import control_plane
 from app.schemas.application import (
     ApplicationBatchCreate,
     ApplicationCreate,
@@ -52,6 +54,19 @@ async def create_application(
         raise ValueError("application_job_tenant_mismatch")
     if auth.enforced and job.tenant_id != tenant_id:
         raise ValueError("application_job_tenant_mismatch")
+    if tenant_id:
+        try:
+            await control_plane.enforce_quota(
+                db,
+                tenant_id=tenant_id,
+                quota_key="daily_applications",
+                increment=1,
+                actor_id=auth.user_id,
+                actor_type="user",
+                context={"operation": "create_application", "job_id": data.job_id},
+            )
+        except control_plane.QuotaExceededError as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
     application = Application(
         tenant_id=tenant_id,
         job_id=data.job_id,
@@ -85,6 +100,19 @@ async def create_batch(
     if tenant_id is None and not get_settings().feature_flags.allow_legacy_unscoped_writes:
         raise ValueError("tenant_id_required_for_batch_create")
     applications: list[Application] = []
+    if tenant_id:
+        try:
+            await control_plane.enforce_quota(
+                db,
+                tenant_id=tenant_id,
+                quota_key="daily_applications",
+                increment=float(len(data.job_ids)),
+                actor_id=auth.user_id,
+                actor_type="user",
+                context={"operation": "create_batch", "job_count": len(data.job_ids)},
+            )
+        except control_plane.QuotaExceededError as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
     for job_id in data.job_ids:
         job_result = await db.execute(select(Job).where(Job.id == job_id))
         job = job_result.scalar_one_or_none()

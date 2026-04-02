@@ -19,12 +19,14 @@ from app.schemas.candidate import (
     CoverLetterVersionResponse,
     ResumeVersionResponse,
 )
+from app.services import control_plane
 
 
 class CandidateService:
     """Application service for candidate CRUD and version metadata."""
 
     def __init__(self, db: AsyncSession) -> None:
+        self._db = db
         self._repo = CandidateRepository(db)
 
     async def list_candidates(self, auth: AuthContext, tenant_id: str | None = None) -> CandidateListResponse:
@@ -56,6 +58,19 @@ class CandidateService:
         )
         if candidate.tenant_id is None and not get_settings().feature_flags.allow_legacy_unscoped_writes:
             raise HTTPException(status_code=400, detail="tenant_id_required_for_candidate_create")
+        if candidate.tenant_id:
+            try:
+                await control_plane.enforce_quota(
+                    self._db,
+                    tenant_id=candidate.tenant_id,
+                    quota_key="candidate_count",
+                    increment=1,
+                    actor_id=auth.user_id,
+                    actor_type="user",
+                    context={"operation": "create_candidate"},
+                )
+            except control_plane.QuotaExceededError as exc:
+                raise HTTPException(status_code=402, detail=str(exc)) from exc
         created = await self._repo.create_candidate(candidate)
         return CandidateResponse.model_validate(created)
 

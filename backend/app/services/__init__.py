@@ -24,6 +24,7 @@ __all__ = [
     "timeline_query",
     "tenant_hardening",
     "ops_diagnostics",
+    "control_plane",
 ]
 
 from . import review_queue
@@ -33,3 +34,5 @@ from . import timeline_query
 from . import tenant_hardening
 
 from . import ops_diagnostics
+
+from . import control_plane
