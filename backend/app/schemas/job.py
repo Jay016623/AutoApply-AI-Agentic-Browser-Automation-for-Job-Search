@@ -61,3 +61,7 @@ class JobAnalysisResponse(BaseModel):
     keyword_match: float
     missing_skills: list[str] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
+    weighted_score: float | None = None
+    confidence: float | None = None
+    risk_level: str | None = None
+    recommendation: str | None = None

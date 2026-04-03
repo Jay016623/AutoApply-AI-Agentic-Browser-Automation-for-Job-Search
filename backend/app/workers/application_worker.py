@@ -23,6 +23,7 @@ from app.config.settings import get_settings
 from app.core.automation.platforms import platform_registry
 from app.core.automation.platforms.base import JobListing
 from app.core.exceptions import AutoApplyError
+from app.core.matching.job_scoring_engine import JobScoringEngine
 from app.db.redis import get_redis, init_redis_pool
 from app.db.session import async_session_factory
 from app.models.application import Application
@@ -176,6 +177,14 @@ async def _run_ats_scoring(job: Job, resume_id: str) -> float | None:
         return None
 
 
+async def _load_resume_for_scoring(resume_id: str) -> Resume | None:
+    if not resume_id:
+        return None
+    async with async_session_factory() as db:
+        result = await db.execute(select(Resume).where(Resume.id == resume_id))
+        return result.scalar_one_or_none()
+
+
 async def process_application(payload: dict[str, Any]) -> None:
     """Process a single application from the queue.
 
@@ -308,7 +317,55 @@ async def process_application(payload: dict[str, Any]) -> None:
         logger.debug("worker.ats_threshold", min_score=min_score)
 
         # --------------------------------------------------------------
-        # Step 4: Apply via platform
+        # Step 4: Weighted scoring decision layer (additive)
+        # --------------------------------------------------------------
+        resume_model = await _load_resume_for_scoring(resume_id)
+        if resume_model is not None and ats_score is not None:
+            resume_model.ats_score = ats_score
+        weighted = JobScoringEngine().score(job=job, resume=resume_model)
+        logger.info(
+            "worker.weighted_score_decision",
+            app_id=app_id,
+            job_id=job_id,
+            score=weighted.score,
+            confidence=weighted.confidence,
+            risk=weighted.risk_level,
+            recommendation=weighted.recommendation,
+        )
+
+        if weighted.recommendation == "skip":
+            detail = (
+                f"Scoring engine recommendation=skip "
+                f"(score={weighted.score}, risk={weighted.risk_level})"
+            )
+            await transitions.fail(
+                app_id,
+                detail=detail,
+                notes=detail,
+                ats_score=ats_score,
+            )
+            return
+
+        if weighted.recommendation == "review" and weighted.confidence >= 0.6 and weighted.score >= 60:
+            await _update_application_status(
+                app_id,
+                ApplicationStatus.PENDING_REVIEW,
+                notes=(
+                    f"Weighted score review: score={weighted.score}, "
+                    f"confidence={weighted.confidence}, risk={weighted.risk_level}"
+                ),
+                ats_score=ats_score,
+                tenant_id=tenant_id,
+            )
+            await _broadcast_progress(
+                app_id,
+                ApplicationStatus.PENDING_REVIEW,
+                "Queued for manual review by weighted scoring policy",
+            )
+            return
+
+        # --------------------------------------------------------------
+        # Step 5: Apply via platform
         # --------------------------------------------------------------
         await transitions.progress(app_id, "submitting")
         job_listing = JobListing(
@@ -338,7 +395,7 @@ async def process_application(payload: dict[str, Any]) -> None:
             return
 
         # --------------------------------------------------------------
-        # Step 5: Update application status to APPLIED
+        # Step 6: Update application status to APPLIED
         # --------------------------------------------------------------
         await transitions.applied(
             app_id,

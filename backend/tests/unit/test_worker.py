@@ -337,6 +337,50 @@ class TestProcessApplicationErrors:
         assert msg["status"] == ApplicationStatus.FAILED
         assert "unexpected" in msg.get("detail", "").lower()
 
+
+    async def test_worker_respects_scoring_skip_recommendation(self):
+        payload = _make_payload(resume_id="resume-1")
+        mock_job = _make_mock_job()
+
+        with (
+            patch("app.workers.application_worker.ws_manager") as mock_ws,
+            patch("app.workers.application_worker.platform_registry") as mock_registry,
+            patch("app.workers.application_worker.get_settings") as mock_settings,
+            patch("app.workers.application_worker.async_session_factory") as mock_sf,
+            patch("app.workers.application_worker._update_application_status", new_callable=AsyncMock),
+            patch("app.workers.application_worker.JobScoringEngine") as mock_engine_cls,
+            patch("app.workers.application_worker._run_ats_scoring", new_callable=AsyncMock) as mock_ats,
+            patch("app.workers.application_worker._load_resume_for_scoring", new_callable=AsyncMock) as mock_load_resume,
+        ):
+            mock_ws.broadcast = AsyncMock()
+            mock_registry.has.return_value = True
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.2,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
+            mock_ats.return_value = 0.9
+            mock_load_resume.return_value = MagicMock(ats_score=0.9, content_text="python")
+
+            engine = MagicMock()
+            engine.score.return_value = MagicMock(
+                score=20.0,
+                confidence=0.9,
+                risk_level="high",
+                recommendation="skip",
+            )
+            mock_engine_cls.return_value = engine
+
+            mock_session = _make_mock_session(mock_job)
+            mock_sf.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_sf.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await process_application(payload)
+
+        last_call = mock_ws.broadcast.call_args_list[-1]
+        msg = last_call.args[0]
+        assert msg["status"] == ApplicationStatus.FAILED
+        assert "recommendation=skip" in msg.get("detail", "")
+
     async def test_worker_handles_job_not_found(self):
         """When the job is not found in DB, worker should broadcast FAILED."""
         payload = _make_payload()
