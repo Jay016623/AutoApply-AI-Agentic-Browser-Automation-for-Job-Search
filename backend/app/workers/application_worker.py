@@ -21,11 +21,13 @@ from app.core.exceptions import AutoApplyError
 from app.db.redis import get_redis, init_redis_pool
 from app.db.session import async_session_factory
 from app.models.application import Application
-from app.models.job import Job
 from app.models.resume import Resume
-from app.schemas.resume import ResumeGenerateRequest
 from app.services import resume as resume_service
 from app.services.queue import dequeue
+from app.workers.orchestration.artifacts import ArtifactOrchestrator
+from app.workers.orchestration.state_transition import StateTransitionOrchestrator
+from app.workers.orchestration.submission import SubmissionOrchestrator
+from app.workers.orchestration.verification import VerificationOrchestrator
 
 logger = structlog.get_logger(__name__)
 
@@ -183,20 +185,30 @@ async def process_application(payload: dict[str, Any]) -> None:
         platform=platform_name,
     )
 
-    await _broadcast_progress(app_id, ApplicationStatus.APPLYING)
+    transitions = StateTransitionOrchestrator(
+        update_status=_update_application_status,
+        broadcast_progress=_broadcast_progress,
+    )
+    verifier = VerificationOrchestrator(
+        session_factory=async_session_factory,
+        platform_registry=platform_registry,
+    )
+    artifacts = ArtifactOrchestrator(
+        session_factory=async_session_factory,
+        resume_service=resume_service,
+    )
+    submission = SubmissionOrchestrator(platform_registry=platform_registry)
+
+    await transitions.progress(app_id, ApplicationStatus.APPLYING)
 
     # Validate platform is registered
-    if not platform_registry.has(platform_name):
+    platform_check = verifier.verify_platform(platform_name)
+    if not platform_check.ok:
         logger.error("worker.unknown_platform", platform=platform_name)
-        await _update_application_status(
+        await transitions.fail(
             app_id,
-            ApplicationStatus.FAILED,
-            notes=f"Unknown platform: {platform_name}",
-        )
-        await _broadcast_progress(
-            app_id,
-            ApplicationStatus.FAILED,
-            detail=f"Unknown platform: {platform_name}",
+            detail=platform_check.error,
+            notes=platform_check.error,
         )
         return
 
@@ -207,77 +219,38 @@ async def process_application(payload: dict[str, Any]) -> None:
         # --------------------------------------------------------------
         # Step 1: Load job details from DB
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "loading_job")
-        job: Job | None = None
-        try:
-            async with async_session_factory() as db:
-                result = await db.execute(
-                    select(Job).where(Job.id == job_id),
-                )
-                job = result.scalar_one_or_none()
-        except Exception as exc:
-            logger.error(
-                "worker.load_job_failed", job_id=job_id, error=str(exc),
-            )
+        await transitions.progress(app_id, "loading_job")
+        job = await verifier.load_job(job_id)
 
         if job is None:
             error_msg = f"Job {job_id} not found in database"
             logger.error("worker.job_not_found", job_id=job_id)
-            await _update_application_status(
-                app_id, ApplicationStatus.FAILED, notes=error_msg,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=error_msg,
+            await transitions.fail(
+                app_id,
+                detail=error_msg,
+                notes=error_msg,
             )
             return
 
         # --------------------------------------------------------------
         # Step 2: Generate tailored resume + cover letter
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "generating_resume")
+        await transitions.progress(app_id, "generating_resume")
         resume_path: str | None = None
-        try:
-            if resume_id:
-                async with async_session_factory() as db:
-                    gen_request = ResumeGenerateRequest(
-                        base_resume_id=resume_id,
-                        job_id=job_id,
-                        template_id="modern",
-                    )
-                    tailored_resp = (
-                        await resume_service.generate_tailored_resume(
-                            db, gen_request,
-                        )
-                    )
-                    result = await db.execute(
-                        select(Resume).where(
-                            Resume.id == tailored_resp.id,
-                        ),
-                    )
-                    tailored_resume = result.scalar_one_or_none()
-
-                if tailored_resume:
-                    resume_path = (
-                        tailored_resume.file_path_pdf
-                        or tailored_resume.file_path_docx
-                    )
-                    logger.info(
-                        "worker.resume_generated",
-                        resume_id=tailored_resume.id,
-                    )
-            else:
-                logger.info("worker.no_base_resume", app_id=app_id)
-        except Exception as exc:
-            logger.warning(
-                "worker.resume_generation_failed",
-                app_id=app_id,
-                error=str(exc),
-            )
+        artifact_bundle = await artifacts.generate_for_application(
+            job_id=job_id,
+            resume_id=resume_id,
+        )
+        resume_path = artifact_bundle.resume_path
+        if resume_path:
+            logger.info("worker.resume_generated", app_id=app_id)
+        elif not resume_id:
+            logger.info("worker.no_base_resume", app_id=app_id)
 
         # --------------------------------------------------------------
         # Step 3: Score with ATS
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "scoring_ats")
+        await transitions.progress(app_id, "scoring_ats")
         ats_score: float | None = None
         try:
             ats_score = await _run_ats_scoring(job, resume_id)
@@ -291,24 +264,14 @@ async def process_application(payload: dict[str, Any]) -> None:
                 error=str(exc),
             )
 
-        if ats_score is not None and ats_score < min_score:
-            skip_msg = (
-                f"ATS score {ats_score:.2f} below minimum "
-                f"threshold {min_score:.2f}"
-            )
-            logger.info(
-                "worker.ats_below_threshold",
-                app_id=app_id,
-                score=ats_score,
-            )
-            await _update_application_status(
+        ats_check = verifier.verify_ats_threshold(ats_score, min_score)
+        if not ats_check.ok:
+            logger.info("worker.ats_below_threshold", app_id=app_id, score=ats_score)
+            await transitions.fail(
                 app_id,
-                ApplicationStatus.FAILED,
-                notes=skip_msg,
+                detail=ats_check.error,
+                notes=ats_check.error,
                 ats_score=ats_score,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=skip_msg,
             )
             return
 
@@ -317,74 +280,41 @@ async def process_application(payload: dict[str, Any]) -> None:
         # --------------------------------------------------------------
         # Step 4: Apply via platform
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "submitting")
-        try:
-            platform = platform_registry.create(platform_name)
-
-            job_listing = JobListing(
-                platform=job.platform,
-                platform_job_id=job.platform_job_id,
-                title=job.title,
-                company=job.company,
-                location=job.location or "",
-                url=job.url,
-                description=job.description or "",
-                job_type=job.job_type or "",
-                remote=job.remote or False,
-            )
-
-            applied = await platform.apply(
-                job=job_listing,
-                resume_path=resume_path or "",
-                cover_letter_path=None,
-            )
-
-            if not applied:
-                raise AutoApplyError(
-                    "Platform returned unsuccessful apply result",
-                    code="PLATFORM_APPLY_FAILED",
-                )
-        except KeyError as exc:
-            error_msg = f"Platform creation failed: {exc}"
-            logger.error(
-                "worker.platform_create_failed", error=str(exc),
-            )
-            await _update_application_status(
-                app_id, ApplicationStatus.FAILED, notes=error_msg,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=error_msg,
-            )
-            return
-        except Exception as exc:
-            error_msg = f"Application submission failed: {exc}"
-            logger.error(
-                "worker.submit_failed",
-                app_id=app_id,
-                platform=platform_name,
-                error=str(exc),
-            )
-            await _update_application_status(
+        await transitions.progress(app_id, "submitting")
+        job_listing = JobListing(
+            platform=job.platform,
+            platform_job_id=job.platform_job_id,
+            title=job.title,
+            company=job.company,
+            location=job.location or "",
+            url=job.url,
+            description=job.description or "",
+            job_type=job.job_type or "",
+            remote=job.remote or False,
+        )
+        submit_result = await submission.submit(
+            platform_name=platform_name,
+            job=job_listing,
+            resume_path=resume_path or "",
+            cover_letter_path=None,
+        )
+        if not submit_result.success:
+            await transitions.fail(
                 app_id,
-                ApplicationStatus.FAILED,
-                notes=error_msg,
+                detail=submit_result.error,
+                notes=submit_result.error,
                 ats_score=ats_score,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=error_msg,
             )
             return
 
         # --------------------------------------------------------------
         # Step 5: Update application status to APPLIED
         # --------------------------------------------------------------
-        await _update_application_status(
+        await transitions.applied(
             app_id,
-            ApplicationStatus.APPLIED,
             ats_score=ats_score,
             applied_at=datetime.now(UTC),
         )
-        await _broadcast_progress(app_id, ApplicationStatus.APPLIED)
         logger.info(
             "worker.completed",
             job_id=job_id,
@@ -399,13 +329,10 @@ async def process_application(payload: dict[str, Any]) -> None:
             error=str(exc),
             code=exc.code,
         )
-        await _update_application_status(
-            app_id, ApplicationStatus.FAILED, notes=str(exc),
-        )
-        await _broadcast_progress(
+        await transitions.fail(
             app_id,
-            ApplicationStatus.FAILED,
             detail=str(exc),
+            notes=str(exc),
         )
 
     except Exception as exc:
@@ -415,15 +342,10 @@ async def process_application(payload: dict[str, Any]) -> None:
             app_id=app_id,
             error=str(exc),
         )
-        await _update_application_status(
+        await transitions.fail(
             app_id,
-            ApplicationStatus.FAILED,
-            notes=f"Unexpected error: {exc}",
-        )
-        await _broadcast_progress(
-            app_id,
-            ApplicationStatus.FAILED,
             detail="Unexpected error during application",
+            notes=f"Unexpected error: {exc}",
         )
 
 
