@@ -338,6 +338,40 @@ class TestProcessApplicationErrors:
         assert "unexpected" in msg.get("detail", "").lower()
 
 
+
+    async def test_worker_holds_for_strategy_gate(self):
+        payload = _make_payload(resume_id="resume-1")
+        mock_job = _make_mock_job()
+
+        with (
+            patch("app.workers.application_worker.ws_manager") as mock_ws,
+            patch("app.workers.application_worker.platform_registry") as mock_registry,
+            patch("app.workers.application_worker.get_settings") as mock_settings,
+            patch("app.workers.application_worker.async_session_factory") as mock_sf,
+            patch("app.workers.application_worker._update_application_status", new_callable=AsyncMock),
+            patch("app.workers.application_worker._evaluate_strategy_gate", new_callable=AsyncMock) as mock_strategy,
+            patch("app.workers.application_worker._run_ats_scoring", new_callable=AsyncMock) as mock_ats,
+        ):
+            mock_ws.broadcast = AsyncMock()
+            mock_registry.has.return_value = True
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.2,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
+            mock_ats.return_value = 0.9
+            mock_strategy.return_value = (False, "strategy_blocked:not_in_top_shortlist")
+
+            mock_session = _make_mock_session(mock_job)
+            mock_sf.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_sf.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await process_application(payload)
+
+        last_call = mock_ws.broadcast.call_args_list[-1]
+        msg = last_call.args[0]
+        assert msg["status"] == ApplicationStatus.PENDING_REVIEW
+        assert "strategy layer" in msg.get("detail", "").lower()
+
     async def test_worker_respects_scoring_skip_recommendation(self):
         payload = _make_payload(resume_id="resume-1")
         mock_job = _make_mock_job()

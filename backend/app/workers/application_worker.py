@@ -30,6 +30,7 @@ from app.models.application import Application
 from app.models.job import Job
 from app.models.resume import Resume
 from app.services import resume as resume_service
+from app.services.application_strategy import ApplicationStrategyLayer
 from app.services.queue import ack, reserve, retry_or_dead_letter
 from app.workers.orchestration.artifacts import ArtifactOrchestrator
 from app.workers.orchestration.state_transition import StateTransitionOrchestrator
@@ -185,6 +186,32 @@ async def _load_resume_for_scoring(resume_id: str) -> Resume | None:
         return result.scalar_one_or_none()
 
 
+async def _evaluate_strategy_gate(
+    *,
+    app_id: str,
+    tenant_id: str | None,
+    resume_id: str | None,
+) -> tuple[bool, str]:
+    try:
+        async with async_session_factory() as db:
+            decision = await ApplicationStrategyLayer(
+                daily_cap_per_candidate=10,
+                top_n=5,
+                low_quality_sources={"glassdoor"},
+            ).evaluate(
+                db,
+                application_id=app_id,
+                tenant_id=tenant_id,
+                resume_id=resume_id,
+            )
+        if decision.allowed:
+            return True, f"selected shortlist={decision.shortlist_application_ids} ranking={decision.priority_ranking}"
+        return False, f"strategy_blocked:{decision.reason} shortlist={decision.shortlist_application_ids}"
+    except Exception as exc:
+        logger.warning("worker.strategy_gate_fallback_allow", app_id=app_id, error=str(exc))
+        return True, "strategy_fallback_allow"
+
+
 async def process_application(payload: dict[str, Any]) -> None:
     """Process a single application from the queue.
 
@@ -317,7 +344,30 @@ async def process_application(payload: dict[str, Any]) -> None:
         logger.debug("worker.ats_threshold", min_score=min_score)
 
         # --------------------------------------------------------------
-        # Step 4: Weighted scoring decision layer (additive)
+        # Step 4: Application strategy shortlist gate
+        # --------------------------------------------------------------
+        strategy_allowed, strategy_note = await _evaluate_strategy_gate(
+            app_id=app_id,
+            tenant_id=tenant_id,
+            resume_id=resume_id,
+        )
+        if not strategy_allowed:
+            await _update_application_status(
+                app_id,
+                ApplicationStatus.PENDING_REVIEW,
+                notes=strategy_note,
+                ats_score=ats_score,
+                tenant_id=tenant_id,
+            )
+            await _broadcast_progress(
+                app_id,
+                ApplicationStatus.PENDING_REVIEW,
+                "Application held by strategy layer before ready_to_apply",
+            )
+            return
+
+        # --------------------------------------------------------------
+        # Step 5: Weighted scoring decision layer (additive)
         # --------------------------------------------------------------
         resume_model = await _load_resume_for_scoring(resume_id)
         if resume_model is not None and ats_score is not None:
@@ -365,7 +415,7 @@ async def process_application(payload: dict[str, Any]) -> None:
             return
 
         # --------------------------------------------------------------
-        # Step 5: Apply via platform
+        # Step 6: Apply via platform
         # --------------------------------------------------------------
         await transitions.progress(app_id, "submitting")
         job_listing = JobListing(
@@ -395,7 +445,7 @@ async def process_application(payload: dict[str, Any]) -> None:
             return
 
         # --------------------------------------------------------------
-        # Step 6: Update application status to APPLIED
+        # Step 7: Update application status to APPLIED
         # --------------------------------------------------------------
         await transitions.applied(
             app_id,
