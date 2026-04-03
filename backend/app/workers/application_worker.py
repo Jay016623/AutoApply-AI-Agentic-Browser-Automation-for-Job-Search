@@ -309,7 +309,12 @@ async def process_application(payload: dict[str, Any]) -> None:
         )
         resume_path = artifact_bundle.resume_path
         if resume_path:
-            logger.info("worker.resume_generated", app_id=app_id)
+            logger.info(
+                "worker.resume_generated",
+                app_id=app_id,
+                selected_resume_id=artifact_bundle.resume_id,
+                decision_reason=artifact_bundle.decision_reason,
+            )
         elif not resume_id:
             logger.info("worker.no_base_resume", app_id=app_id)
 

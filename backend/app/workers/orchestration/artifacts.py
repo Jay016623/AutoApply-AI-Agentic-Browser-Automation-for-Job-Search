@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app.models.resume import Resume
 from app.schemas.resume import ResumeGenerateRequest
+from app.services.resume_selection import select_best_resume_for_job
 
 logger = structlog.get_logger(__name__)
 
@@ -19,6 +20,8 @@ class GeneratedArtifacts:
     """Paths to generated artifacts used during submission."""
 
     resume_path: str | None = None
+    resume_id: str | None = None
+    decision_reason: str = ""
 
 
 @dataclass
@@ -40,8 +43,25 @@ class ArtifactOrchestrator:
 
         try:
             async with self.session_factory() as db:
-                gen_request = ResumeGenerateRequest(
+                decision = await select_best_resume_for_job(
+                    db,
                     base_resume_id=resume_id,
+                    job_id=job_id,
+                )
+
+                selected = decision.selected_resume
+                if selected is None:
+                    return GeneratedArtifacts(decision_reason=decision.reason)
+
+                if not decision.should_tailor:
+                    return GeneratedArtifacts(
+                        resume_path=selected.file_path_pdf or selected.file_path_docx,
+                        resume_id=selected.id,
+                        decision_reason=decision.reason,
+                    )
+
+                gen_request = ResumeGenerateRequest(
+                    base_resume_id=selected.id,
                     job_id=job_id,
                     template_id="modern",
                 )
@@ -53,10 +73,16 @@ class ArtifactOrchestrator:
                 tailored_resume = result.scalar_one_or_none()
 
             if tailored_resume is None:
-                return GeneratedArtifacts()
+                return GeneratedArtifacts(
+                    resume_path=selected.file_path_pdf or selected.file_path_docx,
+                    resume_id=selected.id,
+                    decision_reason="tailor_missing_fallback_selected",
+                )
 
             return GeneratedArtifacts(
                 resume_path=tailored_resume.file_path_pdf or tailored_resume.file_path_docx,
+                resume_id=tailored_resume.id,
+                decision_reason=decision.reason,
             )
         except Exception as exc:
             logger.warning(
@@ -65,4 +91,4 @@ class ArtifactOrchestrator:
                 resume_id=resume_id,
                 error=str(exc),
             )
-            return GeneratedArtifacts()
+            return GeneratedArtifacts(decision_reason="exception_fallback")

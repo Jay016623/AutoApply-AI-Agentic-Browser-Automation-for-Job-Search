@@ -87,3 +87,31 @@ class TestArtifactOrchestrator:
         )
 
         assert result.resume_path is None
+
+
+    async def test_generate_for_application_uses_selected_resume_without_tailoring(self) -> None:
+        orchestrator = ArtifactOrchestrator(
+            session_factory=MagicMock(),
+            resume_service=MagicMock(),
+        )
+
+        mock_db = AsyncMock()
+        orchestrator.session_factory.return_value.__aenter__ = AsyncMock(return_value=mock_db)
+        orchestrator.session_factory.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        selected_resume = MagicMock(id="r1", file_path_pdf="/tmp/r1.pdf", file_path_docx=None)
+
+        from unittest.mock import patch
+
+        with patch("app.workers.orchestration.artifacts.select_best_resume_for_job", new_callable=AsyncMock) as mock_select:
+            mock_select.return_value = MagicMock(
+                selected_resume=selected_resume,
+                should_tailor=False,
+                reason="best_existing_tailored_selected",
+            )
+
+            result = await orchestrator.generate_for_application(job_id="job-1", resume_id="base-1")
+
+        assert result.resume_path == "/tmp/r1.pdf"
+        assert result.resume_id == "r1"
+        assert result.decision_reason == "best_existing_tailored_selected"
