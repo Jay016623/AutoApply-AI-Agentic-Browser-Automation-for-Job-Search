@@ -31,6 +31,7 @@ from app.models.job import Job
 from app.models.resume import Resume
 from app.services import resume as resume_service
 from app.services.application_strategy import ApplicationStrategyLayer
+from app.services.feedback_loop import get_feedback_loop_adjustments
 from app.services.queue import ack, reserve, retry_or_dead_letter
 from app.workers.orchestration.artifacts import ArtifactOrchestrator
 from app.workers.orchestration.state_transition import StateTransitionOrchestrator
@@ -194,10 +195,12 @@ async def _evaluate_strategy_gate(
 ) -> tuple[bool, str]:
     try:
         async with async_session_factory() as db:
+            feedback = await get_feedback_loop_adjustments(db, tenant_id=tenant_id)
             decision = await ApplicationStrategyLayer(
-                daily_cap_per_candidate=10,
-                top_n=5,
-                low_quality_sources={"glassdoor"},
+                daily_cap_per_candidate=feedback.strategy_daily_cap,
+                top_n=feedback.strategy_top_n,
+                low_quality_sources=feedback.blocked_sources or {"glassdoor"},
+                preferred_companies=feedback.preferred_companies,
             ).evaluate(
                 db,
                 application_id=app_id,
@@ -306,6 +309,7 @@ async def process_application(payload: dict[str, Any]) -> None:
         artifact_bundle = await artifacts.generate_for_application(
             job_id=job_id,
             resume_id=resume_id,
+            tenant_id=tenant_id,
         )
         resume_path = artifact_bundle.resume_path
         if resume_path:
@@ -377,7 +381,9 @@ async def process_application(payload: dict[str, Any]) -> None:
         resume_model = await _load_resume_for_scoring(resume_id)
         if resume_model is not None and ats_score is not None:
             resume_model.ats_score = ats_score
-        weighted = JobScoringEngine().score(job=job, resume=resume_model)
+        async with async_session_factory() as db:
+            feedback = await get_feedback_loop_adjustments(db, tenant_id=tenant_id)
+        weighted = JobScoringEngine(weights_override=feedback.scoring_weights).score(job=job, resume=resume_model)
         logger.info(
             "worker.weighted_score_decision",
             app_id=app_id,

@@ -35,10 +35,12 @@ class ApplicationStrategyLayer:
         daily_cap_per_candidate: int = 10,
         top_n: int = 5,
         low_quality_sources: set[str] | None = None,
+        preferred_companies: set[str] | None = None,
     ) -> None:
         self.daily_cap_per_candidate = daily_cap_per_candidate
         self.top_n = top_n
         self.low_quality_sources = low_quality_sources or {"unknown"}
+        self.preferred_companies = preferred_companies or set()
 
     async def evaluate(
         self,
@@ -107,7 +109,7 @@ class ApplicationStrategyLayer:
             score = float(job.match_score or 0.0)
             if score <= 0:
                 score = scorer.score(job=job, resume=resume).score
-            if job.company in historical_response_companies:
+            if job.company in historical_response_companies or job.company in self.preferred_companies:
                 score += 10.0
             scored.append((candidate_app.id, job.company, score))
 

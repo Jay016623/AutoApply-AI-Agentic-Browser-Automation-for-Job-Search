@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app.models.resume import Resume
 from app.schemas.resume import ResumeGenerateRequest
+from app.services.feedback_loop import get_feedback_loop_adjustments
 from app.services.resume_selection import select_best_resume_for_job
 
 logger = structlog.get_logger(__name__)
@@ -36,6 +37,7 @@ class ArtifactOrchestrator:
         *,
         job_id: str,
         resume_id: str,
+        tenant_id: str | None = None,
     ) -> GeneratedArtifacts:
         """Generate tailored resume artifacts when base resume is present."""
         if not resume_id:
@@ -43,10 +45,13 @@ class ArtifactOrchestrator:
 
         try:
             async with self.session_factory() as db:
+                feedback = await get_feedback_loop_adjustments(db, tenant_id=tenant_id)
                 decision = await select_best_resume_for_job(
                     db,
                     base_resume_id=resume_id,
                     job_id=job_id,
+                    max_tailored_versions_per_job=feedback.max_tailored_versions_per_job,
+                    base_fit_keep_threshold=feedback.base_fit_keep_threshold,
                 )
 
                 selected = decision.selected_resume

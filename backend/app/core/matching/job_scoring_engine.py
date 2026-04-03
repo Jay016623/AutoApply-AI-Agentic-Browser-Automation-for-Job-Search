@@ -31,6 +31,9 @@ class JobScoreResult:
 class JobScoringEngine:
     """Heuristic weighted scorer for apply decision support."""
 
+    def __init__(self, weights_override: dict[str, float] | None = None) -> None:
+        self._weights_override = weights_override or {}
+
     def score(
         self,
         *,
@@ -57,6 +60,11 @@ class JobScoringEngine:
             "recency_of_job": 0.1,
             "resume_strength_for_job": 0.15,
         }
+        weights.update({k: v for k, v in self._weights_override.items() if k in weights and v >= 0})
+        weight_sum = sum(weights.values())
+        if weight_sum > 0:
+            weights = {k: v / weight_sum for k, v in weights.items()}
+
         raw_score = sum(dimensions[key] * weights[key] for key in dimensions)
         score = round(max(0.0, min(100.0, raw_score * 100.0)), 2)
 
