@@ -11,6 +11,7 @@ from app.schemas.analytics import (
     DashboardStats,
     LLMUsageStats,
     TimelineEntry,
+    ConversionDashboard,
 )
 from app.services import analytics as analytics_service
 
@@ -76,3 +77,15 @@ async def timeline(
 ) -> list[TimelineEntry]:
     """Get daily activity timeline entries."""
     return await analytics_service.get_timeline(db)
+
+
+@router.get(
+    "/conversion-dashboard",
+    response_model=ConversionDashboard,
+    summary="Get conversion business outcome dashboard",
+)
+async def conversion_dashboard(
+    db: AsyncSession = Depends(get_db),
+) -> ConversionDashboard:
+    """Get business outcome conversion metrics for applications."""
+    return await analytics_service.get_conversion_dashboard(db)

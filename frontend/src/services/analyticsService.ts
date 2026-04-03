@@ -5,6 +5,7 @@ import type {
   ATSScoreDistribution,
   LLMUsageStats,
   TimelineEntry,
+  ConversionDashboard,
 } from '@/types/analytics';
 
 /** Get aggregated dashboard statistics. */
@@ -34,5 +35,12 @@ export async function getLLMUsage(): Promise<LLMUsageStats[]> {
 /** Get daily activity timeline. */
 export async function getTimeline(): Promise<TimelineEntry[]> {
   const { data } = await api.get<TimelineEntry[]>('/analytics/timeline');
+  return data;
+}
+
+
+/** Get business outcome conversion dashboard metrics. */
+export async function getConversionDashboard(): Promise<ConversionDashboard> {
+  const { data } = await api.get<ConversionDashboard>('/analytics/conversion-dashboard');
   return data;
 }
