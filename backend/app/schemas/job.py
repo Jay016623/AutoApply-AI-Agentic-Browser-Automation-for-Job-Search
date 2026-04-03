@@ -22,6 +22,7 @@ class JobListingResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    tenant_id: str | None = None
     platform: str
     platform_job_id: str
     title: str
@@ -60,3 +61,7 @@ class JobAnalysisResponse(BaseModel):
     keyword_match: float
     missing_skills: list[str] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
+    weighted_score: float | None = None
+    confidence: float | None = None
+    risk_level: str | None = None
+    recommendation: str | None = None

@@ -6,6 +6,7 @@ are mocked so these tests run without infrastructure.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config.constants import ApplicationStatus
@@ -94,7 +95,10 @@ class TestProcessApplicationHappyPath:
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
             mock_registry.create.return_value = mock_platform
-            mock_settings.return_value = MagicMock(min_ats_score=0.75)
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
 
             mock_session = _make_mock_session(mock_job)
             mock_sf.return_value.__aenter__ = AsyncMock(
@@ -144,7 +148,10 @@ class TestProcessApplicationHappyPath:
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
             mock_registry.create.return_value = mock_platform
-            mock_settings.return_value = MagicMock(min_ats_score=0.75)
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
 
             mock_session = _make_mock_session(mock_job)
             mock_sf.return_value.__aenter__ = AsyncMock(
@@ -169,6 +176,9 @@ class TestProcessApplicationErrors:
                 "app.workers.application_worker.ws_manager",
             ) as mock_ws,
             patch(
+                "app.workers.application_worker.get_settings",
+            ) as mock_settings,
+            patch(
                 "app.workers.application_worker.platform_registry",
             ) as mock_registry,
             patch(
@@ -177,6 +187,10 @@ class TestProcessApplicationErrors:
             ),
         ):
             mock_ws.broadcast = AsyncMock()
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
             mock_registry.has.return_value = False
 
             await process_application(payload)
@@ -185,6 +199,27 @@ class TestProcessApplicationErrors:
         msg = last_call.args[0]
         assert msg["status"] == ApplicationStatus.FAILED
         assert "unknown_platform" in msg.get("detail", "").lower()
+
+    async def test_worker_enforces_tenant_context_when_strict(self):
+        """Worker should fail fast if strict tenant mode is enabled and tenant_id is missing."""
+        payload = _make_payload()
+
+        with (
+            patch("app.workers.application_worker.ws_manager") as mock_ws,
+            patch("app.workers.application_worker.get_settings") as mock_settings,
+        ):
+            mock_ws.broadcast = AsyncMock()
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=True),
+            )
+
+            await process_application(payload)
+
+        last_call = mock_ws.broadcast.call_args_list[-1]
+        msg = last_call.args[0]
+        assert msg["status"] == ApplicationStatus.FAILED
+        assert "tenant context" in msg.get("detail", "").lower()
 
     async def test_worker_handles_empty_payload(self):
         """Worker should handle an empty payload without crashing."""
@@ -195,6 +230,9 @@ class TestProcessApplicationErrors:
                 "app.workers.application_worker.ws_manager",
             ) as mock_ws,
             patch(
+                "app.workers.application_worker.get_settings",
+            ) as mock_settings,
+            patch(
                 "app.workers.application_worker.platform_registry",
             ) as mock_registry,
             patch(
@@ -203,6 +241,10 @@ class TestProcessApplicationErrors:
             ),
         ):
             mock_ws.broadcast = AsyncMock()
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
             mock_registry.has.return_value = False
 
             # Should not raise
@@ -295,6 +337,84 @@ class TestProcessApplicationErrors:
         assert msg["status"] == ApplicationStatus.FAILED
         assert "unexpected" in msg.get("detail", "").lower()
 
+
+
+    async def test_worker_holds_for_strategy_gate(self):
+        payload = _make_payload(resume_id="resume-1")
+        mock_job = _make_mock_job()
+
+        with (
+            patch("app.workers.application_worker.ws_manager") as mock_ws,
+            patch("app.workers.application_worker.platform_registry") as mock_registry,
+            patch("app.workers.application_worker.get_settings") as mock_settings,
+            patch("app.workers.application_worker.async_session_factory") as mock_sf,
+            patch("app.workers.application_worker._update_application_status", new_callable=AsyncMock),
+            patch("app.workers.application_worker._evaluate_strategy_gate", new_callable=AsyncMock) as mock_strategy,
+            patch("app.workers.application_worker._run_ats_scoring", new_callable=AsyncMock) as mock_ats,
+        ):
+            mock_ws.broadcast = AsyncMock()
+            mock_registry.has.return_value = True
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.2,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
+            mock_ats.return_value = 0.9
+            mock_strategy.return_value = (False, "strategy_blocked:not_in_top_shortlist")
+
+            mock_session = _make_mock_session(mock_job)
+            mock_sf.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_sf.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await process_application(payload)
+
+        last_call = mock_ws.broadcast.call_args_list[-1]
+        msg = last_call.args[0]
+        assert msg["status"] == ApplicationStatus.PENDING_REVIEW
+        assert "strategy layer" in msg.get("detail", "").lower()
+
+    async def test_worker_respects_scoring_skip_recommendation(self):
+        payload = _make_payload(resume_id="resume-1")
+        mock_job = _make_mock_job()
+
+        with (
+            patch("app.workers.application_worker.ws_manager") as mock_ws,
+            patch("app.workers.application_worker.platform_registry") as mock_registry,
+            patch("app.workers.application_worker.get_settings") as mock_settings,
+            patch("app.workers.application_worker.async_session_factory") as mock_sf,
+            patch("app.workers.application_worker._update_application_status", new_callable=AsyncMock),
+            patch("app.workers.application_worker.JobScoringEngine") as mock_engine_cls,
+            patch("app.workers.application_worker._run_ats_scoring", new_callable=AsyncMock) as mock_ats,
+            patch("app.workers.application_worker._load_resume_for_scoring", new_callable=AsyncMock) as mock_load_resume,
+        ):
+            mock_ws.broadcast = AsyncMock()
+            mock_registry.has.return_value = True
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.2,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
+            mock_ats.return_value = 0.9
+            mock_load_resume.return_value = MagicMock(ats_score=0.9, content_text="python")
+
+            engine = MagicMock()
+            engine.score.return_value = MagicMock(
+                score=20.0,
+                confidence=0.9,
+                risk_level="high",
+                recommendation="skip",
+            )
+            mock_engine_cls.return_value = engine
+
+            mock_session = _make_mock_session(mock_job)
+            mock_sf.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_sf.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await process_application(payload)
+
+        last_call = mock_ws.broadcast.call_args_list[-1]
+        msg = last_call.args[0]
+        assert msg["status"] == ApplicationStatus.FAILED
+        assert "recommendation=skip" in msg.get("detail", "")
+
     async def test_worker_handles_job_not_found(self):
         """When the job is not found in DB, worker should broadcast FAILED."""
         payload = _make_payload()
@@ -319,7 +439,10 @@ class TestProcessApplicationErrors:
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
-            mock_settings.return_value = MagicMock(min_ats_score=0.75)
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
 
             # Return None for job lookup
             mock_session = _make_mock_session(None)
@@ -373,3 +496,55 @@ class TestRunWorker:
             "app.workers.application_worker.get_redis", return_value=None,
         ):
             await run_worker()  # should not block or raise
+
+
+class TestWorkerIdempotency:
+    async def test_mark_attempt_once_returns_true_then_false(self):
+        from app.workers.application_worker import _mark_attempt_once
+
+        class _RedisStub:
+            def __init__(self):
+                self._seen = set()
+
+            async def set(self, key, value, ex=None, nx=False):
+                if nx and key in self._seen:
+                    return False
+                self._seen.add(key)
+                return True
+
+        redis = _RedisStub()
+
+        first = await _mark_attempt_once(redis, "attempt-1")
+        second = await _mark_attempt_once(redis, "attempt-1")
+
+        assert first is True
+        assert second is False
+
+    async def test_duplicate_attempt_is_acked_and_skipped(self):
+        from app.workers.application_worker import run_worker
+
+        with (
+            patch("app.workers.application_worker.get_settings") as mock_settings,
+            patch("app.workers.application_worker.init_redis_pool", new_callable=AsyncMock),
+            patch("app.workers.application_worker.get_redis") as mock_get_redis,
+            patch("app.workers.application_worker.reserve", new_callable=AsyncMock) as mock_reserve,
+            patch("app.workers.application_worker._mark_attempt_once", new_callable=AsyncMock) as mock_mark,
+            patch("app.workers.application_worker.ack", new_callable=AsyncMock) as mock_ack,
+            patch("app.workers.application_worker.process_application", new_callable=AsyncMock) as mock_process,
+        ):
+            mock_settings.return_value = MagicMock(redis_url="redis://localhost:6379/0")
+            mock_get_redis.return_value = object()
+            mock_reserve.side_effect = [
+                {"task_id": "t1", "attempt_id": "dup", "payload": {}},
+                asyncio.CancelledError(),
+            ]
+            mock_mark.return_value = False
+
+            try:
+                await run_worker()
+            except asyncio.CancelledError:
+                # exit infinite loop after second iteration
+                pass
+
+            mock_ack.assert_awaited()
+            mock_process.assert_not_called()

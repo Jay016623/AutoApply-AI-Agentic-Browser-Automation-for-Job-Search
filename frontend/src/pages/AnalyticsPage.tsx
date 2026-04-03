@@ -30,6 +30,7 @@ import {
   useATSDistribution,
   useLLMUsage,
   useTimeline,
+  useConversionDashboard,
 } from '@/hooks/useAnalytics';
 
 function AnalyticsPage() {
@@ -37,8 +38,9 @@ function AnalyticsPage() {
   const { data: atsDistribution, isLoading: atsLoading } = useATSDistribution();
   const { data: llmUsage, isLoading: llmLoading } = useLLMUsage();
   const { data: timeline, isLoading: timelineLoading } = useTimeline();
+  const { data: conversion, isLoading: conversionLoading } = useConversionDashboard();
 
-  const isLoading = funnelLoading || atsLoading || llmLoading || timelineLoading;
+  const isLoading = funnelLoading || atsLoading || llmLoading || timelineLoading || conversionLoading;
 
   if (isLoading) {
     return <LoadingState message="Loading analytics..." />;
@@ -55,6 +57,58 @@ function AnalyticsPage() {
         </Typography>
 
         <Grid container spacing={3}>
+
+          {/* Conversion Outcome Dashboard */}
+          <Grid item xs={12}>
+            <Card>
+              <CardContent>
+                <Typography variant="h6" gutterBottom>
+                  Conversion Outcome Dashboard
+                </Typography>
+                {conversion ? (
+                  <Grid container spacing={2} sx={{ mb: 2 }}>
+                    <Grid item xs={12} md={4}>
+                      <Typography variant="body2" color="text.secondary">Applications Sent</Typography>
+                      <Typography variant="h5">{conversion.applications_sent}</Typography>
+                    </Grid>
+                    <Grid item xs={12} md={4}>
+                      <Typography variant="body2" color="text.secondary">Response Rate</Typography>
+                      <Typography variant="h5">{(conversion.response_rate * 100).toFixed(1)}%</Typography>
+                    </Grid>
+                    <Grid item xs={12} md={4}>
+                      <Typography variant="body2" color="text.secondary">Interview Rate</Typography>
+                      <Typography variant="h5">{(conversion.interview_rate * 100).toFixed(1)}%</Typography>
+                    </Grid>
+
+                    <Grid item xs={12} md={4}>
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>Per-Candidate Success</Typography>
+                      {conversion.per_candidate_success.slice(0, 5).map((item) => (
+                        <Typography key={`cand-${item.key}`} variant="body2">
+                          {item.key}: {(item.response_rate * 100).toFixed(1)}%
+                        </Typography>
+                      ))}
+                    </Grid>
+                    <Grid item xs={12} md={4}>
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>Per-Source Success</Typography>
+                      {conversion.per_source_success.slice(0, 5).map((item) => (
+                        <Typography key={`src-${item.key}`} variant="body2">
+                          {item.key}: {(item.response_rate * 100).toFixed(1)}%
+                        </Typography>
+                      ))}
+                    </Grid>
+                    <Grid item xs={12} md={4}>
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>Per-Role Success</Typography>
+                      {conversion.per_role_success.slice(0, 5).map((item) => (
+                        <Typography key={`role-${item.key}`} variant="body2">
+                          {item.key}: {(item.response_rate * 100).toFixed(1)}%
+                        </Typography>
+                      ))}
+                    </Grid>
+                  </Grid>
+                ) : null}
+              </CardContent>
+            </Card>
+          </Grid>
           {/* Activity Timeline */}
           <Grid item xs={12}>
             <Card>

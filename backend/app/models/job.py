@@ -16,7 +16,11 @@ class Job(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UniqueConstraint("platform", "platform_job_id", name="uq_job_platform_id"),
         Index("ix_job_status", "status"),
         Index("ix_job_match_score", "match_score"),
+        Index("ix_job_tenant", "tenant_id"),
     )
+
+    # Tenant scope
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Platform identification
     platform: Mapped[str] = mapped_column(String(50), nullable=False)

@@ -17,6 +17,7 @@ from app.core.documents.generator import DocumentGenerator
 from app.core.documents.parser import DocumentParser, ParsedResume
 from app.core.exceptions import ParseError, RecordNotFoundError
 from app.core.llm.client import LLMClient
+from app.models.candidate import Candidate
 from app.models.job import Job
 from app.models.resume import Resume
 from app.models.resume_version import ResumeVersion
@@ -406,6 +407,23 @@ async def _create_resume_version(
     if not candidate_id:
         return
 
+    candidate_tenant_id: str | None = None
+    candidate_result = await db.execute(
+        select(Candidate).where(Candidate.id == candidate_id),
+    )
+    candidate = candidate_result.scalar_one_or_none()
+    if candidate is not None:
+        candidate_tenant_id = candidate.tenant_id
+
+    strict_mode = get_settings().feature_flags.tenant_enforcement
+    if strict_mode and not candidate_tenant_id:
+        logger.warning(
+            "resume_version_skipped_missing_tenant",
+            candidate_id=candidate_id,
+            resume_id=resume.id,
+        )
+        return
+
     result = await db.execute(
         select(ResumeVersion)
         .where(ResumeVersion.candidate_id == candidate_id)
@@ -416,7 +434,7 @@ async def _create_resume_version(
     next_version = (latest.version + 1) if latest is not None else 1
 
     version = ResumeVersion(
-        tenant_id=None,
+        tenant_id=candidate_tenant_id,
         candidate_id=candidate_id,
         resume_id=resume.id,
         job_id=resume.job_id,

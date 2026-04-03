@@ -13,19 +13,30 @@ import structlog
 from sqlalchemy import select
 
 from app.api.websocket.events import manager as ws_manager
-from app.config.constants import QUEUE_APPLY, ApplicationStatus
+from app.config.constants import (
+    QUEUE_APPLY,
+    QUEUE_APPLY_DEAD_LETTER,
+    QUEUE_APPLY_PROCESSING,
+    ApplicationStatus,
+)
 from app.config.settings import get_settings
 from app.core.automation.platforms import platform_registry
 from app.core.automation.platforms.base import JobListing
 from app.core.exceptions import AutoApplyError
+from app.core.matching.job_scoring_engine import JobScoringEngine
 from app.db.redis import get_redis, init_redis_pool
 from app.db.session import async_session_factory
 from app.models.application import Application
 from app.models.job import Job
 from app.models.resume import Resume
-from app.schemas.resume import ResumeGenerateRequest
 from app.services import resume as resume_service
-from app.services.queue import dequeue
+from app.services.application_strategy import ApplicationStrategyLayer
+from app.services.feedback_loop import get_feedback_loop_adjustments
+from app.services.queue import ack, reserve, retry_or_dead_letter
+from app.workers.orchestration.artifacts import ArtifactOrchestrator
+from app.workers.orchestration.state_transition import StateTransitionOrchestrator
+from app.workers.orchestration.submission import SubmissionOrchestrator
+from app.workers.orchestration.verification import VerificationOrchestrator
 
 logger = structlog.get_logger(__name__)
 
@@ -58,6 +69,7 @@ async def _update_application_status(
     notes: str | None = None,
     ats_score: float | None = None,
     applied_at: datetime | None = None,
+    tenant_id: str | None = None,
 ) -> None:
     """Persist application status changes to the database.
 
@@ -70,12 +82,17 @@ async def _update_application_status(
     """
     try:
         async with async_session_factory() as db:
-            result = await db.execute(
-                select(Application).where(Application.id == app_id),
-            )
+            query = select(Application).where(Application.id == app_id)
+            if tenant_id is not None:
+                query = query.where(Application.tenant_id == tenant_id)
+            result = await db.execute(query)
             app = result.scalar_one_or_none()
             if app is None:
-                logger.warning("worker.app_not_found_for_update", app_id=app_id)
+                logger.warning(
+                    "worker.app_not_found_for_update",
+                    app_id=app_id,
+                    tenant_id=tenant_id,
+                )
                 return
             app.status = status
             if notes is not None:
@@ -162,6 +179,42 @@ async def _run_ats_scoring(job: Job, resume_id: str) -> float | None:
         return None
 
 
+async def _load_resume_for_scoring(resume_id: str) -> Resume | None:
+    if not resume_id:
+        return None
+    async with async_session_factory() as db:
+        result = await db.execute(select(Resume).where(Resume.id == resume_id))
+        return result.scalar_one_or_none()
+
+
+async def _evaluate_strategy_gate(
+    *,
+    app_id: str,
+    tenant_id: str | None,
+    resume_id: str | None,
+) -> tuple[bool, str]:
+    try:
+        async with async_session_factory() as db:
+            feedback = await get_feedback_loop_adjustments(db, tenant_id=tenant_id)
+            decision = await ApplicationStrategyLayer(
+                daily_cap_per_candidate=feedback.strategy_daily_cap,
+                top_n=feedback.strategy_top_n,
+                low_quality_sources=feedback.blocked_sources or {"glassdoor"},
+                preferred_companies=feedback.preferred_companies,
+            ).evaluate(
+                db,
+                application_id=app_id,
+                tenant_id=tenant_id,
+                resume_id=resume_id,
+            )
+        if decision.allowed:
+            return True, f"selected shortlist={decision.shortlist_application_ids} ranking={decision.priority_ranking}"
+        return False, f"strategy_blocked:{decision.reason} shortlist={decision.shortlist_application_ids}"
+    except Exception as exc:
+        logger.warning("worker.strategy_gate_fallback_allow", app_id=app_id, error=str(exc))
+        return True, "strategy_fallback_allow"
+
+
 async def process_application(payload: dict[str, Any]) -> None:
     """Process a single application from the queue.
 
@@ -175,6 +228,8 @@ async def process_application(payload: dict[str, Any]) -> None:
     app_id: str = payload.get("application_id", "")
     resume_id: str = payload.get("resume_id", "")
     platform_name: str = payload.get("platform", "")
+    tenant_id_raw: str | None = payload.get("tenant_id")
+    tenant_id = tenant_id_raw.strip() if isinstance(tenant_id_raw, str) else tenant_id_raw
 
     logger.info(
         "worker.processing",
@@ -183,101 +238,94 @@ async def process_application(payload: dict[str, Any]) -> None:
         platform=platform_name,
     )
 
-    await _broadcast_progress(app_id, ApplicationStatus.APPLYING)
+    settings = get_settings()
+    strict_tenant_mode = settings.feature_flags.tenant_enforcement
+    if strict_tenant_mode and not tenant_id:
+        guardrail_msg = "Missing tenant context for execution write path"
+        logger.error(
+            "worker.missing_tenant_context",
+            app_id=app_id,
+            job_id=job_id,
+        )
+        await _broadcast_progress(app_id, ApplicationStatus.FAILED, guardrail_msg)
+        return
+
+    transitions = StateTransitionOrchestrator(
+        update_status=lambda _app_id, _status, **kwargs: _update_application_status(
+            _app_id,
+            _status,
+            tenant_id=tenant_id,
+            **kwargs,
+        ),
+        broadcast_progress=_broadcast_progress,
+    )
+    verifier = VerificationOrchestrator(
+        session_factory=async_session_factory,
+        platform_registry=platform_registry,
+    )
+    artifacts = ArtifactOrchestrator(
+        session_factory=async_session_factory,
+        resume_service=resume_service,
+    )
+    submission = SubmissionOrchestrator(platform_registry=platform_registry)
+
+    await transitions.progress(app_id, ApplicationStatus.APPLYING)
 
     # Validate platform is registered
-    if not platform_registry.has(platform_name):
+    platform_check = verifier.verify_platform(platform_name)
+    if not platform_check.ok:
         logger.error("worker.unknown_platform", platform=platform_name)
-        await _update_application_status(
+        await transitions.fail(
             app_id,
-            ApplicationStatus.FAILED,
-            notes=f"Unknown platform: {platform_name}",
-        )
-        await _broadcast_progress(
-            app_id,
-            ApplicationStatus.FAILED,
-            detail=f"Unknown platform: {platform_name}",
+            detail=platform_check.error,
+            notes=platform_check.error,
         )
         return
 
     try:
-        settings = get_settings()
         min_score = settings.min_ats_score
 
         # --------------------------------------------------------------
         # Step 1: Load job details from DB
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "loading_job")
-        job: Job | None = None
-        try:
-            async with async_session_factory() as db:
-                result = await db.execute(
-                    select(Job).where(Job.id == job_id),
-                )
-                job = result.scalar_one_or_none()
-        except Exception as exc:
-            logger.error(
-                "worker.load_job_failed", job_id=job_id, error=str(exc),
-            )
+        await transitions.progress(app_id, "loading_job")
+        job = await verifier.load_job(job_id, tenant_id=tenant_id)
 
         if job is None:
             error_msg = f"Job {job_id} not found in database"
             logger.error("worker.job_not_found", job_id=job_id)
-            await _update_application_status(
-                app_id, ApplicationStatus.FAILED, notes=error_msg,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=error_msg,
+            await transitions.fail(
+                app_id,
+                detail=error_msg,
+                notes=error_msg,
             )
             return
 
         # --------------------------------------------------------------
         # Step 2: Generate tailored resume + cover letter
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "generating_resume")
+        await transitions.progress(app_id, "generating_resume")
         resume_path: str | None = None
-        try:
-            if resume_id:
-                async with async_session_factory() as db:
-                    gen_request = ResumeGenerateRequest(
-                        base_resume_id=resume_id,
-                        job_id=job_id,
-                        template_id="modern",
-                    )
-                    tailored_resp = (
-                        await resume_service.generate_tailored_resume(
-                            db, gen_request,
-                        )
-                    )
-                    result = await db.execute(
-                        select(Resume).where(
-                            Resume.id == tailored_resp.id,
-                        ),
-                    )
-                    tailored_resume = result.scalar_one_or_none()
-
-                if tailored_resume:
-                    resume_path = (
-                        tailored_resume.file_path_pdf
-                        or tailored_resume.file_path_docx
-                    )
-                    logger.info(
-                        "worker.resume_generated",
-                        resume_id=tailored_resume.id,
-                    )
-            else:
-                logger.info("worker.no_base_resume", app_id=app_id)
-        except Exception as exc:
-            logger.warning(
-                "worker.resume_generation_failed",
+        artifact_bundle = await artifacts.generate_for_application(
+            job_id=job_id,
+            resume_id=resume_id,
+            tenant_id=tenant_id,
+        )
+        resume_path = artifact_bundle.resume_path
+        if resume_path:
+            logger.info(
+                "worker.resume_generated",
                 app_id=app_id,
-                error=str(exc),
+                selected_resume_id=artifact_bundle.resume_id,
+                decision_reason=artifact_bundle.decision_reason,
             )
+        elif not resume_id:
+            logger.info("worker.no_base_resume", app_id=app_id)
 
         # --------------------------------------------------------------
         # Step 3: Score with ATS
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "scoring_ats")
+        await transitions.progress(app_id, "scoring_ats")
         ats_score: float | None = None
         try:
             ats_score = await _run_ats_scoring(job, resume_id)
@@ -291,100 +339,130 @@ async def process_application(payload: dict[str, Any]) -> None:
                 error=str(exc),
             )
 
-        if ats_score is not None and ats_score < min_score:
-            skip_msg = (
-                f"ATS score {ats_score:.2f} below minimum "
-                f"threshold {min_score:.2f}"
-            )
-            logger.info(
-                "worker.ats_below_threshold",
-                app_id=app_id,
-                score=ats_score,
-            )
-            await _update_application_status(
+        ats_check = verifier.verify_ats_threshold(ats_score, min_score)
+        if not ats_check.ok:
+            logger.info("worker.ats_below_threshold", app_id=app_id, score=ats_score)
+            await transitions.fail(
                 app_id,
-                ApplicationStatus.FAILED,
-                notes=skip_msg,
+                detail=ats_check.error,
+                notes=ats_check.error,
                 ats_score=ats_score,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=skip_msg,
             )
             return
 
         logger.debug("worker.ats_threshold", min_score=min_score)
 
         # --------------------------------------------------------------
-        # Step 4: Apply via platform
+        # Step 4: Application strategy shortlist gate
         # --------------------------------------------------------------
-        await _broadcast_progress(app_id, "submitting")
-        try:
-            platform = platform_registry.create(platform_name)
-
-            job_listing = JobListing(
-                platform=job.platform,
-                platform_job_id=job.platform_job_id,
-                title=job.title,
-                company=job.company,
-                location=job.location or "",
-                url=job.url,
-                description=job.description or "",
-                job_type=job.job_type or "",
-                remote=job.remote or False,
-            )
-
-            applied = await platform.apply(
-                job=job_listing,
-                resume_path=resume_path or "",
-                cover_letter_path=None,
-            )
-
-            if not applied:
-                raise AutoApplyError(
-                    "Platform returned unsuccessful apply result",
-                    code="PLATFORM_APPLY_FAILED",
-                )
-        except KeyError as exc:
-            error_msg = f"Platform creation failed: {exc}"
-            logger.error(
-                "worker.platform_create_failed", error=str(exc),
-            )
-            await _update_application_status(
-                app_id, ApplicationStatus.FAILED, notes=error_msg,
-            )
-            await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=error_msg,
-            )
-            return
-        except Exception as exc:
-            error_msg = f"Application submission failed: {exc}"
-            logger.error(
-                "worker.submit_failed",
-                app_id=app_id,
-                platform=platform_name,
-                error=str(exc),
-            )
+        strategy_allowed, strategy_note = await _evaluate_strategy_gate(
+            app_id=app_id,
+            tenant_id=tenant_id,
+            resume_id=resume_id,
+        )
+        if not strategy_allowed:
             await _update_application_status(
                 app_id,
-                ApplicationStatus.FAILED,
-                notes=error_msg,
+                ApplicationStatus.PENDING_REVIEW,
+                notes=strategy_note,
                 ats_score=ats_score,
+                tenant_id=tenant_id,
             )
             await _broadcast_progress(
-                app_id, ApplicationStatus.FAILED, detail=error_msg,
+                app_id,
+                ApplicationStatus.PENDING_REVIEW,
+                "Application held by strategy layer before ready_to_apply",
             )
             return
 
         # --------------------------------------------------------------
-        # Step 5: Update application status to APPLIED
+        # Step 5: Weighted scoring decision layer (additive)
         # --------------------------------------------------------------
-        await _update_application_status(
+        resume_model = await _load_resume_for_scoring(resume_id)
+        if resume_model is not None and ats_score is not None:
+            resume_model.ats_score = ats_score
+        async with async_session_factory() as db:
+            feedback = await get_feedback_loop_adjustments(db, tenant_id=tenant_id)
+        weighted = JobScoringEngine(weights_override=feedback.scoring_weights).score(job=job, resume=resume_model)
+        logger.info(
+            "worker.weighted_score_decision",
+            app_id=app_id,
+            job_id=job_id,
+            score=weighted.score,
+            confidence=weighted.confidence,
+            risk=weighted.risk_level,
+            recommendation=weighted.recommendation,
+        )
+
+        if weighted.recommendation == "skip":
+            detail = (
+                f"Scoring engine recommendation=skip "
+                f"(score={weighted.score}, risk={weighted.risk_level})"
+            )
+            await transitions.fail(
+                app_id,
+                detail=detail,
+                notes=detail,
+                ats_score=ats_score,
+            )
+            return
+
+        if weighted.recommendation == "review" and weighted.confidence >= 0.6 and weighted.score >= 60:
+            await _update_application_status(
+                app_id,
+                ApplicationStatus.PENDING_REVIEW,
+                notes=(
+                    f"Weighted score review: score={weighted.score}, "
+                    f"confidence={weighted.confidence}, risk={weighted.risk_level}"
+                ),
+                ats_score=ats_score,
+                tenant_id=tenant_id,
+            )
+            await _broadcast_progress(
+                app_id,
+                ApplicationStatus.PENDING_REVIEW,
+                "Queued for manual review by weighted scoring policy",
+            )
+            return
+
+        # --------------------------------------------------------------
+        # Step 6: Apply via platform
+        # --------------------------------------------------------------
+        await transitions.progress(app_id, "submitting")
+        job_listing = JobListing(
+            platform=job.platform,
+            platform_job_id=job.platform_job_id,
+            title=job.title,
+            company=job.company,
+            location=job.location or "",
+            url=job.url,
+            description=job.description or "",
+            job_type=job.job_type or "",
+            remote=job.remote or False,
+        )
+        submit_result = await submission.submit(
+            platform_name=platform_name,
+            job=job_listing,
+            resume_path=resume_path or "",
+            cover_letter_path=None,
+        )
+        if not submit_result.success:
+            await transitions.fail(
+                app_id,
+                detail=submit_result.error,
+                notes=submit_result.error,
+                ats_score=ats_score,
+            )
+            return
+
+        # --------------------------------------------------------------
+        # Step 7: Update application status to APPLIED
+        # --------------------------------------------------------------
+        await transitions.applied(
             app_id,
-            ApplicationStatus.APPLIED,
             ats_score=ats_score,
             applied_at=datetime.now(UTC),
         )
-        await _broadcast_progress(app_id, ApplicationStatus.APPLIED)
         logger.info(
             "worker.completed",
             job_id=job_id,
@@ -399,13 +477,10 @@ async def process_application(payload: dict[str, Any]) -> None:
             error=str(exc),
             code=exc.code,
         )
-        await _update_application_status(
-            app_id, ApplicationStatus.FAILED, notes=str(exc),
-        )
-        await _broadcast_progress(
+        await transitions.fail(
             app_id,
-            ApplicationStatus.FAILED,
             detail=str(exc),
+            notes=str(exc),
         )
 
     except Exception as exc:
@@ -415,16 +490,17 @@ async def process_application(payload: dict[str, Any]) -> None:
             app_id=app_id,
             error=str(exc),
         )
-        await _update_application_status(
+        await transitions.fail(
             app_id,
-            ApplicationStatus.FAILED,
+            detail="Unexpected error during application",
             notes=f"Unexpected error: {exc}",
         )
-        await _broadcast_progress(
-            app_id,
-            ApplicationStatus.FAILED,
-            detail="Unexpected error during application",
-        )
+
+
+async def _mark_attempt_once(redis: Any, attempt_id: str, ttl_seconds: int = 3600) -> bool:
+    """Mark attempt as seen for idempotency. Returns True if newly marked."""
+    key = f"autoapply:queue:attempt:{attempt_id}"
+    return bool(await redis.set(key, "1", ex=ttl_seconds, nx=True))
 
 
 async def run_worker() -> None:
@@ -443,13 +519,55 @@ async def run_worker() -> None:
     logger.info("worker.started", queue=QUEUE_APPLY)
 
     while True:
+        message = None
         try:
-            message = await dequeue(redis, QUEUE_APPLY, timeout=5)
-            if message is not None:
-                payload = message.get("payload", {})
-                await process_application(payload)
+            message = await reserve(
+                redis,
+                QUEUE_APPLY,
+                QUEUE_APPLY_PROCESSING,
+                timeout=5,
+                visibility_timeout_seconds=120,
+            )
+            if message is None:
+                continue
+
+            attempt_id = message.get("attempt_id", "")
+            is_new_attempt = await _mark_attempt_once(redis, attempt_id)
+            if not is_new_attempt:
+                logger.info(
+                    "worker.duplicate_attempt_skipped",
+                    attempt_id=attempt_id,
+                    task_id=message.get("task_id"),
+                )
+                await ack(redis, QUEUE_APPLY_PROCESSING, message)
+                continue
+
+            payload = message.get("payload", {})
+            logger.info(
+                "worker.message_reserved",
+                task_id=message.get("task_id"),
+                attempt_id=attempt_id,
+                retry_count=message.get("retry_count", 0),
+                trace_id=message.get("trace_id"),
+                tenant_id=message.get("tenant_id"),
+            )
+            await process_application(payload)
+            await ack(redis, QUEUE_APPLY_PROCESSING, message)
         except Exception as exc:
-            logger.error("worker.loop_error", error=str(exc))
+            logger.error(
+                "worker.loop_error",
+                error=str(exc),
+                task_id=(message or {}).get("task_id"),
+                attempt_id=(message or {}).get("attempt_id"),
+            )
+            if message is not None:
+                await retry_or_dead_letter(
+                    redis,
+                    queue_name=QUEUE_APPLY,
+                    processing_queue_name=QUEUE_APPLY_PROCESSING,
+                    dead_letter_queue_name=QUEUE_APPLY_DEAD_LETTER,
+                    message=message,
+                )
             await asyncio.sleep(1)
 
 

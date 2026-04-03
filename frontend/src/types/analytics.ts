@@ -40,3 +40,22 @@ export interface TimelineEntry {
   applications_applied: number;
   jobs_found: number;
 }
+
+
+/** Conversion slice grouped by a business dimension. */
+export interface ConversionSlice {
+  key: string;
+  applications_sent: number;
+  response_rate: number;
+  interview_rate: number;
+}
+
+/** Business outcome conversion dashboard. */
+export interface ConversionDashboard {
+  applications_sent: number;
+  response_rate: number;
+  interview_rate: number;
+  per_candidate_success: ConversionSlice[];
+  per_source_success: ConversionSlice[];
+  per_role_success: ConversionSlice[];
+}

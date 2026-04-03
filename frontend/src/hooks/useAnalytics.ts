@@ -43,3 +43,12 @@ export function useTimeline() {
     queryFn: () => analyticsService.getTimeline(),
   });
 }
+
+
+/** Fetch conversion business outcome dashboard metrics. */
+export function useConversionDashboard() {
+  return useQuery({
+    queryKey: [...ANALYTICS_KEY, 'conversion-dashboard'],
+    queryFn: () => analyticsService.getConversionDashboard(),
+  });
+}

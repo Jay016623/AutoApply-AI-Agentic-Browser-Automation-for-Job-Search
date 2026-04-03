@@ -12,12 +12,15 @@ from app.config.constants import ApplicationStatus
 from app.models.application import Application
 from app.models.job import Job
 from app.models.llm_usage import LLMUsage
+from app.models.resume import Resume
 from app.schemas.analytics import (
     ApplicationFunnelData,
     ATSScoreDistribution,
     DashboardStats,
     LLMUsageStats,
     TimelineEntry,
+    ConversionDashboard,
+    ConversionSlice,
 )
 
 logger = structlog.get_logger(__name__)
@@ -237,3 +240,66 @@ async def get_timeline(db: AsyncSession) -> list[TimelineEntry]:
         )
         for d in all_dates
     ]
+
+
+
+def _safe_rate(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(numerator / denominator, 4)
+
+
+async def get_conversion_dashboard(db: AsyncSession) -> ConversionDashboard:
+    """Compute conversion-outcome dashboard metrics."""
+    rows = (
+        await db.execute(
+            select(
+                Application.status,
+                Resume.candidate_id,
+                Job.platform,
+                Job.title,
+            )
+            .select_from(Application)
+            .join(Job, Job.id == Application.job_id)
+            .join(Resume, Resume.id == Application.resume_id, isouter=True),
+        )
+    ).all()
+
+    total_sent = len(rows)
+    responded = sum(1 for status, *_ in rows if status in {ApplicationStatus.INTERVIEW, ApplicationStatus.OFFER})
+    interviewed = sum(1 for status, *_ in rows if status == ApplicationStatus.INTERVIEW)
+
+    def build_slices(values: list[tuple[str, str]]) -> list[ConversionSlice]:
+        agg: dict[str, tuple[int, int, int]] = {}
+        for key, status in values:
+            sent, resp, inter = agg.get(key, (0, 0, 0))
+            sent += 1
+            if status in {ApplicationStatus.INTERVIEW, ApplicationStatus.OFFER}:
+                resp += 1
+            if status == ApplicationStatus.INTERVIEW:
+                inter += 1
+            agg[key] = (sent, resp, inter)
+
+        ranked = sorted(agg.items(), key=lambda kv: (kv[1][1], kv[1][0]), reverse=True)
+        return [
+            ConversionSlice(
+                key=key,
+                applications_sent=sent,
+                response_rate=_safe_rate(resp, sent),
+                interview_rate=_safe_rate(inter, sent),
+            )
+            for key, (sent, resp, inter) in ranked[:20]
+        ]
+
+    candidate_values = [((candidate_id or "unattributed"), status) for status, candidate_id, _, _ in rows]
+    source_values = [((platform or "unknown"), status) for status, _, platform, _ in rows]
+    role_values = [((title or "unknown role"), status) for status, _, _, title in rows]
+
+    return ConversionDashboard(
+        applications_sent=total_sent,
+        response_rate=_safe_rate(responded, total_sent),
+        interview_rate=_safe_rate(interviewed, total_sent),
+        per_candidate_success=build_slices(candidate_values),
+        per_source_success=build_slices(source_values),
+        per_role_success=build_slices(role_values),
+    )

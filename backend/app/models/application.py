@@ -15,7 +15,11 @@ class Application(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         Index("ix_application_status", "status"),
         Index("ix_application_job_id", "job_id"),
+        Index("ix_application_tenant", "tenant_id"),
     )
+
+    # Tenant scope
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Foreign keys
     job_id: Mapped[str] = mapped_column(

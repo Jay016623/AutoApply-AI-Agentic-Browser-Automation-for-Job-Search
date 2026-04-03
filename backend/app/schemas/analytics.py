@@ -1,6 +1,6 @@
 """Pydantic schemas for analytics and dashboard API responses."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DashboardStats(BaseModel):
@@ -49,3 +49,23 @@ class TimelineEntry(BaseModel):
     applications_created: int = 0
     applications_applied: int = 0
     jobs_found: int = 0
+
+
+class ConversionSlice(BaseModel):
+    """Conversion metric slice for a grouping dimension."""
+
+    key: str
+    applications_sent: int = 0
+    response_rate: float = 0.0
+    interview_rate: float = 0.0
+
+
+class ConversionDashboard(BaseModel):
+    """Business outcome conversion dashboard metrics."""
+
+    applications_sent: int = 0
+    response_rate: float = 0.0
+    interview_rate: float = 0.0
+    per_candidate_success: list[ConversionSlice] = Field(default_factory=list)
+    per_source_success: list[ConversionSlice] = Field(default_factory=list)
+    per_role_success: list[ConversionSlice] = Field(default_factory=list)

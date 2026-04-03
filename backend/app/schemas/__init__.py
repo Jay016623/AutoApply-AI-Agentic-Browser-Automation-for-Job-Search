@@ -6,6 +6,8 @@ from app.schemas.analytics import (
     DashboardStats,
     LLMUsageStats,
     TimelineEntry,
+    ConversionDashboard,
+    ConversionSlice,
 )
 from app.schemas.application import (
     ApplicationBatchCreate,
@@ -52,6 +54,8 @@ __all__ = [
     "ApplicationResponse",
     "ApplicationStatusUpdate",
     "DashboardStats",
+    "ConversionDashboard",
+    "ConversionSlice",
     # candidate
     "CandidateCreate",
     "CandidateListResponse",

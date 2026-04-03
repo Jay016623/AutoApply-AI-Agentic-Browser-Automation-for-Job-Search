@@ -91,6 +91,20 @@ class TestListJobs:
         assert response.status_code == 200
         assert response.json()["total"] == 0
 
+    async def test_list_scoped_by_tenant_header(self, client, db_session, job_data):
+        tenant_a = "tenant-a"
+        tenant_b = "tenant-b"
+        job_a = Job(**{**job_data, "platform_job_id": "job-tenant-a", "tenant_id": tenant_a})
+        job_b = Job(**{**job_data, "platform_job_id": "job-tenant-b", "tenant_id": tenant_b})
+        db_session.add_all([job_a, job_b])
+        await db_session.commit()
+
+        response = await client.get(f"{API_PREFIX}/", headers={"X-Tenant-Id": tenant_a})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] == 1
+        assert body["items"][0]["tenant_id"] == tenant_a
+
 
 class TestGetJob:
     """Tests for GET /api/v1/jobs/{job_id}."""

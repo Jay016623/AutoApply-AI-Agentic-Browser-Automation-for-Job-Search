@@ -92,3 +92,19 @@ class TestTimeline:
         body = response.json()
         assert isinstance(body, list)
         assert len(body) == 0
+
+
+class TestConversionDashboard:
+    """Tests for GET /api/v1/analytics/conversion-dashboard."""
+
+    async def test_conversion_dashboard_empty(self, client):
+        response = await client.get(f"{API_PREFIX}/conversion-dashboard")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["applications_sent"] == 0
+        assert body["response_rate"] == 0.0
+        assert body["interview_rate"] == 0.0
+        assert body["per_candidate_success"] == []
+        assert body["per_source_success"] == []
+        assert body["per_role_success"] == []

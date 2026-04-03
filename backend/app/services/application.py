@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, ApplicationStatus
 from app.core.exceptions import RecordNotFoundError
 from app.models.application import Application
+from app.models.job import Job
 from app.schemas.application import (
     ApplicationBatchCreate,
     ApplicationCreate,
@@ -26,6 +27,7 @@ logger = structlog.get_logger(__name__)
 async def create_application(
     db: AsyncSession,
     data: ApplicationCreate,
+    tenant_id: str | None = None,
 ) -> Application:
     """Create a single job application.
 
@@ -36,7 +38,15 @@ async def create_application(
     Returns:
         The newly created Application.
     """
+    if tenant_id is not None:
+        job_result = await db.execute(
+            select(Job).where(Job.id == data.job_id, Job.tenant_id == tenant_id),
+        )
+        if job_result.scalar_one_or_none() is None:
+            raise RecordNotFoundError("Job", data.job_id)
+
     application = Application(
+        tenant_id=tenant_id,
         job_id=data.job_id,
         resume_id=data.resume_id,
         apply_mode=data.apply_mode,
@@ -52,6 +62,7 @@ async def create_application(
 async def create_batch(
     db: AsyncSession,
     data: ApplicationBatchCreate,
+    tenant_id: str | None = None,
 ) -> list[Application]:
     """Create multiple applications at once.
 
@@ -64,7 +75,14 @@ async def create_batch(
     """
     applications: list[Application] = []
     for job_id in data.job_ids:
+        if tenant_id is not None:
+            job_result = await db.execute(
+                select(Job).where(Job.id == job_id, Job.tenant_id == tenant_id),
+            )
+            if job_result.scalar_one_or_none() is None:
+                raise RecordNotFoundError("Job", job_id)
         app = Application(
+            tenant_id=tenant_id,
             job_id=job_id,
             resume_id=data.resume_id,
             apply_mode=data.apply_mode,
@@ -86,6 +104,7 @@ async def list_applications(
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
     status: str | None = None,
+    tenant_id: str | None = None,
 ) -> ApplicationListResponse:
     """List applications with pagination and optional status filter.
 
@@ -103,6 +122,10 @@ async def list_applications(
 
     query = select(Application)
     count_query = select(func.count(Application.id))
+
+    if tenant_id is not None:
+        query = query.where(Application.tenant_id == tenant_id)
+        count_query = count_query.where(Application.tenant_id == tenant_id)
 
     if status:
         query = query.where(Application.status == status)
@@ -127,7 +150,11 @@ async def list_applications(
     )
 
 
-async def get_application(db: AsyncSession, app_id: str) -> Application:
+async def get_application(
+    db: AsyncSession,
+    app_id: str,
+    tenant_id: str | None = None,
+) -> Application:
     """Get a single application by ID.
 
     Args:
@@ -140,16 +167,21 @@ async def get_application(db: AsyncSession, app_id: str) -> Application:
     Raises:
         RecordNotFoundError: If application does not exist.
     """
-    result = await db.execute(
-        select(Application).where(Application.id == app_id),
-    )
+    query = select(Application).where(Application.id == app_id)
+    if tenant_id is not None:
+        query = query.where(Application.tenant_id == tenant_id)
+    result = await db.execute(query)
     app = result.scalar_one_or_none()
     if app is None:
         raise RecordNotFoundError("Application", app_id)
     return app
 
 
-async def approve_application(db: AsyncSession, app_id: str) -> Application:
+async def approve_application(
+    db: AsyncSession,
+    app_id: str,
+    tenant_id: str | None = None,
+) -> Application:
     """Approve a pending application for submission.
 
     Args:
@@ -162,7 +194,7 @@ async def approve_application(db: AsyncSession, app_id: str) -> Application:
     Raises:
         RecordNotFoundError: If application does not exist.
     """
-    app = await get_application(db, app_id)
+    app = await get_application(db, app_id, tenant_id=tenant_id)
     if app.status not in (ApplicationStatus.PENDING_REVIEW, ApplicationStatus.QUEUED):
         raise ValueError(
             f"Cannot approve application in '{app.status}' state. "
@@ -179,6 +211,7 @@ async def update_status(
     db: AsyncSession,
     app_id: str,
     update: ApplicationStatusUpdate,
+    tenant_id: str | None = None,
 ) -> Application:
     """Update an application's status and optional notes.
 
@@ -193,7 +226,7 @@ async def update_status(
     Raises:
         RecordNotFoundError: If application does not exist.
     """
-    app = await get_application(db, app_id)
+    app = await get_application(db, app_id, tenant_id=tenant_id)
     app.status = update.status
     if update.notes is not None:
         app.notes = update.notes
