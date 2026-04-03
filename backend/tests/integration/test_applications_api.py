@@ -62,6 +62,30 @@ class TestCreateApplication:
 
         assert response.status_code == 422
 
+    async def test_create_application_scoped_by_tenant_header(self, client, db_session, job_data):
+        tenant_id = "tenant-create"
+        tenant_job = Job(**{**job_data, "platform_job_id": "tenant-create-job", "tenant_id": tenant_id})
+        other_job = Job(**{**job_data, "platform_job_id": "tenant-other-job", "tenant_id": "tenant-other"})
+        db_session.add_all([tenant_job, other_job])
+        await db_session.commit()
+        await db_session.refresh(tenant_job)
+        await db_session.refresh(other_job)
+
+        ok_response = await client.post(
+            f"{API_PREFIX}/",
+            json={"job_id": tenant_job.id, "apply_mode": "review"},
+            headers={"X-Tenant-Id": tenant_id},
+        )
+        assert ok_response.status_code == 201
+        assert ok_response.json()["tenant_id"] == tenant_id
+
+        bad_response = await client.post(
+            f"{API_PREFIX}/",
+            json={"job_id": other_job.id, "apply_mode": "review"},
+            headers={"X-Tenant-Id": tenant_id},
+        )
+        assert bad_response.status_code == 404
+
 
 class TestBatchCreateApplications:
     """Tests for POST /api/v1/applications/batch."""
@@ -127,6 +151,20 @@ class TestListApplications:
         body = response.json()
         assert body["page"] == 1
         assert body["page_size"] == 5
+
+    async def test_list_scoped_by_tenant_header(self, client, db_session, sample_job):
+        tenant_a = "tenant-a"
+        tenant_b = "tenant-b"
+        app_a = Application(job_id=sample_job.id, status="queued", apply_mode="review", tenant_id=tenant_a)
+        app_b = Application(job_id=sample_job.id, status="queued", apply_mode="review", tenant_id=tenant_b)
+        db_session.add_all([app_a, app_b])
+        await db_session.commit()
+
+        response = await client.get(f"{API_PREFIX}/", headers={"X-Tenant-Id": tenant_a})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] == 1
+        assert body["items"][0]["tenant_id"] == tenant_a
 
 
 class TestGetApplication:

@@ -58,6 +58,7 @@ class ApplicationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    tenant_id: str | None = None
     job_id: str
     resume_id: str | None = None
     status: str

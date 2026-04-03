@@ -31,6 +31,7 @@ logger = structlog.get_logger(__name__)
 async def search_jobs(
     db: AsyncSession,
     request: JobSearchRequest,
+    tenant_id: str | None = None,
 ) -> JobListResponse:
     """Search for jobs across configured platforms.
 
@@ -48,6 +49,7 @@ async def search_jobs(
     """
     logger.info(
         "job_search_requested",
+        tenant_id=tenant_id,
         query=request.query,
         location=request.location,
         platforms=request.platforms,
@@ -99,9 +101,11 @@ async def search_jobs(
         for listing in listings:
             try:
                 job = _listing_to_job(listing)
+                job.tenant_id = tenant_id
                 # Check for duplicates before inserting
                 existing = await db.execute(
                     select(Job).where(
+                        Job.tenant_id == tenant_id,
                         Job.platform == job.platform,
                         Job.platform_job_id == job.platform_job_id,
                     ),
@@ -138,8 +142,10 @@ async def search_jobs(
             for listing in exa_listings:
                 try:
                     job = _listing_to_job(listing)
+                    job.tenant_id = tenant_id
                     existing = await db.execute(
                         select(Job).where(
+                            Job.tenant_id == tenant_id,
                             Job.platform == job.platform,
                             Job.platform_job_id == job.platform_job_id,
                         ),
@@ -224,6 +230,7 @@ async def list_jobs(
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
     status: str | None = None,
+    tenant_id: str | None = None,
 ) -> JobListResponse:
     """List jobs with pagination and optional status filter.
 
@@ -241,6 +248,10 @@ async def list_jobs(
 
     query = select(Job)
     count_query = select(func.count(Job.id))
+
+    if tenant_id is not None:
+        query = query.where(Job.tenant_id == tenant_id)
+        count_query = count_query.where(Job.tenant_id == tenant_id)
 
     if status:
         query = query.where(Job.status == status)
@@ -265,7 +276,11 @@ async def list_jobs(
     )
 
 
-async def get_job(db: AsyncSession, job_id: str) -> Job:
+async def get_job(
+    db: AsyncSession,
+    job_id: str,
+    tenant_id: str | None = None,
+) -> Job:
     """Get a single job by ID.
 
     Args:
@@ -278,14 +293,21 @@ async def get_job(db: AsyncSession, job_id: str) -> Job:
     Raises:
         RecordNotFoundError: If job does not exist.
     """
-    result = await db.execute(select(Job).where(Job.id == job_id))
+    query = select(Job).where(Job.id == job_id)
+    if tenant_id is not None:
+        query = query.where(Job.tenant_id == tenant_id)
+    result = await db.execute(query)
     job = result.scalar_one_or_none()
     if job is None:
         raise RecordNotFoundError("Job", job_id)
     return job
 
 
-async def delete_job(db: AsyncSession, job_id: str) -> None:
+async def delete_job(
+    db: AsyncSession,
+    job_id: str,
+    tenant_id: str | None = None,
+) -> None:
     """Delete a job by ID.
 
     Args:
@@ -295,7 +317,7 @@ async def delete_job(db: AsyncSession, job_id: str) -> None:
     Raises:
         RecordNotFoundError: If job does not exist.
     """
-    job = await get_job(db, job_id)
+    job = await get_job(db, job_id, tenant_id=tenant_id)
     await db.delete(job)
     await db.commit()
     logger.info("job_deleted", job_id=job_id)
@@ -305,6 +327,7 @@ async def analyze_job(
     db: AsyncSession,
     job_id: str,
     resume_id: str | None = None,
+    tenant_id: str | None = None,
 ) -> JobAnalysisResponse:
     """Analyze job-candidate match using ATS scoring.
 
@@ -323,7 +346,7 @@ async def analyze_job(
     Raises:
         RecordNotFoundError: If job does not exist.
     """
-    job = await get_job(db, job_id)
+    job = await get_job(db, job_id, tenant_id=tenant_id)
     logger.info("job_analysis_requested", job_id=job_id, title=job.title)
 
     # If no resume provided, return placeholder scores
