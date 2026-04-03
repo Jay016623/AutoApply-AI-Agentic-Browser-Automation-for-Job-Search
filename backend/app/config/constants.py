@@ -9,6 +9,8 @@ APP_TITLE = "AutoApply AI"
 
 # Queue names (Redis)
 QUEUE_APPLY = "autoapply:queue:apply"
+QUEUE_APPLY_PROCESSING = "autoapply:queue:apply:processing"
+QUEUE_APPLY_DEAD_LETTER = "autoapply:queue:apply:dead_letter"
 QUEUE_SCRAPE = "autoapply:queue:scrape"
 QUEUE_GENERATE = "autoapply:queue:generate"
 

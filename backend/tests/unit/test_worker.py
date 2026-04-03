@@ -6,6 +6,7 @@ are mocked so these tests run without infrastructure.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config.constants import ApplicationStatus
@@ -417,3 +418,55 @@ class TestRunWorker:
             "app.workers.application_worker.get_redis", return_value=None,
         ):
             await run_worker()  # should not block or raise
+
+
+class TestWorkerIdempotency:
+    async def test_mark_attempt_once_returns_true_then_false(self):
+        from app.workers.application_worker import _mark_attempt_once
+
+        class _RedisStub:
+            def __init__(self):
+                self._seen = set()
+
+            async def set(self, key, value, ex=None, nx=False):
+                if nx and key in self._seen:
+                    return False
+                self._seen.add(key)
+                return True
+
+        redis = _RedisStub()
+
+        first = await _mark_attempt_once(redis, "attempt-1")
+        second = await _mark_attempt_once(redis, "attempt-1")
+
+        assert first is True
+        assert second is False
+
+    async def test_duplicate_attempt_is_acked_and_skipped(self):
+        from app.workers.application_worker import run_worker
+
+        with (
+            patch("app.workers.application_worker.get_settings") as mock_settings,
+            patch("app.workers.application_worker.init_redis_pool", new_callable=AsyncMock),
+            patch("app.workers.application_worker.get_redis") as mock_get_redis,
+            patch("app.workers.application_worker.reserve", new_callable=AsyncMock) as mock_reserve,
+            patch("app.workers.application_worker._mark_attempt_once", new_callable=AsyncMock) as mock_mark,
+            patch("app.workers.application_worker.ack", new_callable=AsyncMock) as mock_ack,
+            patch("app.workers.application_worker.process_application", new_callable=AsyncMock) as mock_process,
+        ):
+            mock_settings.return_value = MagicMock(redis_url="redis://localhost:6379/0")
+            mock_get_redis.return_value = object()
+            mock_reserve.side_effect = [
+                {"task_id": "t1", "attempt_id": "dup", "payload": {}},
+                asyncio.CancelledError(),
+            ]
+            mock_mark.return_value = False
+
+            try:
+                await run_worker()
+            except asyncio.CancelledError:
+                # exit infinite loop after second iteration
+                pass
+
+            mock_ack.assert_awaited()
+            mock_process.assert_not_called()

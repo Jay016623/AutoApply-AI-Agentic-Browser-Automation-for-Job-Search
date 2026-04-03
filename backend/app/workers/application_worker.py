@@ -13,7 +13,12 @@ import structlog
 from sqlalchemy import select
 
 from app.api.websocket.events import manager as ws_manager
-from app.config.constants import QUEUE_APPLY, ApplicationStatus
+from app.config.constants import (
+    QUEUE_APPLY,
+    QUEUE_APPLY_DEAD_LETTER,
+    QUEUE_APPLY_PROCESSING,
+    ApplicationStatus,
+)
 from app.config.settings import get_settings
 from app.core.automation.platforms import platform_registry
 from app.core.automation.platforms.base import JobListing
@@ -24,7 +29,7 @@ from app.models.application import Application
 from app.models.job import Job
 from app.models.resume import Resume
 from app.services import resume as resume_service
-from app.services.queue import dequeue
+from app.services.queue import ack, reserve, retry_or_dead_letter
 from app.workers.orchestration.artifacts import ArtifactOrchestrator
 from app.workers.orchestration.state_transition import StateTransitionOrchestrator
 from app.workers.orchestration.submission import SubmissionOrchestrator
@@ -374,6 +379,12 @@ async def process_application(payload: dict[str, Any]) -> None:
         )
 
 
+async def _mark_attempt_once(redis: Any, attempt_id: str, ttl_seconds: int = 3600) -> bool:
+    """Mark attempt as seen for idempotency. Returns True if newly marked."""
+    key = f"autoapply:queue:attempt:{attempt_id}"
+    return bool(await redis.set(key, "1", ex=ttl_seconds, nx=True))
+
+
 async def run_worker() -> None:
     """Main worker loop consuming from the apply queue.
 
@@ -390,13 +401,55 @@ async def run_worker() -> None:
     logger.info("worker.started", queue=QUEUE_APPLY)
 
     while True:
+        message = None
         try:
-            message = await dequeue(redis, QUEUE_APPLY, timeout=5)
-            if message is not None:
-                payload = message.get("payload", {})
-                await process_application(payload)
+            message = await reserve(
+                redis,
+                QUEUE_APPLY,
+                QUEUE_APPLY_PROCESSING,
+                timeout=5,
+                visibility_timeout_seconds=120,
+            )
+            if message is None:
+                continue
+
+            attempt_id = message.get("attempt_id", "")
+            is_new_attempt = await _mark_attempt_once(redis, attempt_id)
+            if not is_new_attempt:
+                logger.info(
+                    "worker.duplicate_attempt_skipped",
+                    attempt_id=attempt_id,
+                    task_id=message.get("task_id"),
+                )
+                await ack(redis, QUEUE_APPLY_PROCESSING, message)
+                continue
+
+            payload = message.get("payload", {})
+            logger.info(
+                "worker.message_reserved",
+                task_id=message.get("task_id"),
+                attempt_id=attempt_id,
+                retry_count=message.get("retry_count", 0),
+                trace_id=message.get("trace_id"),
+                tenant_id=message.get("tenant_id"),
+            )
+            await process_application(payload)
+            await ack(redis, QUEUE_APPLY_PROCESSING, message)
         except Exception as exc:
-            logger.error("worker.loop_error", error=str(exc))
+            logger.error(
+                "worker.loop_error",
+                error=str(exc),
+                task_id=(message or {}).get("task_id"),
+                attempt_id=(message or {}).get("attempt_id"),
+            )
+            if message is not None:
+                await retry_or_dead_letter(
+                    redis,
+                    queue_name=QUEUE_APPLY,
+                    processing_queue_name=QUEUE_APPLY_PROCESSING,
+                    dead_letter_queue_name=QUEUE_APPLY_DEAD_LETTER,
+                    message=message,
+                )
             await asyncio.sleep(1)
 
 
