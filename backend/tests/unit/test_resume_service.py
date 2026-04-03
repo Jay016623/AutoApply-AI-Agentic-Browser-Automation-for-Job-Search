@@ -3,10 +3,13 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select
 
 from app.core.exceptions import RecordNotFoundError
 from app.models.job import Job
+from app.models.candidate import Candidate
 from app.models.resume import Resume
+from app.models.resume_version import ResumeVersion
 from app.schemas.resume import ResumeGenerateRequest, ResumeScoreRequest
 from app.services import resume as resume_service
 
@@ -136,3 +139,78 @@ class TestGetResumeNotFound:
     async def test_get_resume_not_found(self, db_session):
         with pytest.raises(RecordNotFoundError):
             await resume_service.get_resume(db_session, "nonexistent_id")
+
+
+class TestResumeVersionTenantOwnership:
+    async def test_create_resume_version_uses_candidate_tenant(self, db_session):
+        candidate = Candidate(
+            full_name="Tenant User",
+            email="tenant-user@example.com",
+            tenant_id="tenant-123",
+        )
+        db_session.add(candidate)
+        await db_session.commit()
+        await db_session.refresh(candidate)
+
+        resume = Resume(
+            name="Base",
+            type="base",
+            template_id="modern",
+            candidate_id=candidate.id,
+        )
+        db_session.add(resume)
+        await db_session.commit()
+        await db_session.refresh(resume)
+
+        await resume_service._create_resume_version(
+            db=db_session,
+            resume=resume,
+            candidate_id=candidate.id,
+            variant_type="base",
+            label="Base",
+        )
+
+        result = await db_session.execute(
+            select(ResumeVersion).where(ResumeVersion.candidate_id == candidate.id),
+        )
+        version = result.scalar_one_or_none()
+        assert version is not None
+        assert version.tenant_id == "tenant-123"
+
+    async def test_create_resume_version_skips_when_strict_without_tenant(self, db_session):
+        candidate = Candidate(
+            full_name="No Tenant",
+            email="no-tenant@example.com",
+            tenant_id=None,
+        )
+        db_session.add(candidate)
+        await db_session.commit()
+        await db_session.refresh(candidate)
+
+        resume = Resume(
+            name="Base",
+            type="base",
+            template_id="modern",
+            candidate_id=candidate.id,
+        )
+        db_session.add(resume)
+        await db_session.commit()
+        await db_session.refresh(resume)
+
+        with patch("app.services.resume.get_settings") as mock_settings:
+            mock_settings.return_value = MagicMock(
+                feature_flags=MagicMock(tenant_enforcement=True),
+            )
+            await resume_service._create_resume_version(
+                db=db_session,
+                resume=resume,
+                candidate_id=candidate.id,
+                variant_type="base",
+                label="Base",
+            )
+
+        result = await db_session.execute(
+            select(ResumeVersion).where(ResumeVersion.candidate_id == candidate.id),
+        )
+        version = result.scalar_one_or_none()
+        assert version is None

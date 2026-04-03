@@ -94,7 +94,10 @@ class TestProcessApplicationHappyPath:
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
             mock_registry.create.return_value = mock_platform
-            mock_settings.return_value = MagicMock(min_ats_score=0.75)
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
 
             mock_session = _make_mock_session(mock_job)
             mock_sf.return_value.__aenter__ = AsyncMock(
@@ -144,7 +147,10 @@ class TestProcessApplicationHappyPath:
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
             mock_registry.create.return_value = mock_platform
-            mock_settings.return_value = MagicMock(min_ats_score=0.75)
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
 
             mock_session = _make_mock_session(mock_job)
             mock_sf.return_value.__aenter__ = AsyncMock(
@@ -169,6 +175,9 @@ class TestProcessApplicationErrors:
                 "app.workers.application_worker.ws_manager",
             ) as mock_ws,
             patch(
+                "app.workers.application_worker.get_settings",
+            ) as mock_settings,
+            patch(
                 "app.workers.application_worker.platform_registry",
             ) as mock_registry,
             patch(
@@ -177,6 +186,10 @@ class TestProcessApplicationErrors:
             ),
         ):
             mock_ws.broadcast = AsyncMock()
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
             mock_registry.has.return_value = False
 
             await process_application(payload)
@@ -185,6 +198,27 @@ class TestProcessApplicationErrors:
         msg = last_call.args[0]
         assert msg["status"] == ApplicationStatus.FAILED
         assert "unknown_platform" in msg.get("detail", "").lower()
+
+    async def test_worker_enforces_tenant_context_when_strict(self):
+        """Worker should fail fast if strict tenant mode is enabled and tenant_id is missing."""
+        payload = _make_payload()
+
+        with (
+            patch("app.workers.application_worker.ws_manager") as mock_ws,
+            patch("app.workers.application_worker.get_settings") as mock_settings,
+        ):
+            mock_ws.broadcast = AsyncMock()
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=True),
+            )
+
+            await process_application(payload)
+
+        last_call = mock_ws.broadcast.call_args_list[-1]
+        msg = last_call.args[0]
+        assert msg["status"] == ApplicationStatus.FAILED
+        assert "tenant context" in msg.get("detail", "").lower()
 
     async def test_worker_handles_empty_payload(self):
         """Worker should handle an empty payload without crashing."""
@@ -195,6 +229,9 @@ class TestProcessApplicationErrors:
                 "app.workers.application_worker.ws_manager",
             ) as mock_ws,
             patch(
+                "app.workers.application_worker.get_settings",
+            ) as mock_settings,
+            patch(
                 "app.workers.application_worker.platform_registry",
             ) as mock_registry,
             patch(
@@ -203,6 +240,10 @@ class TestProcessApplicationErrors:
             ),
         ):
             mock_ws.broadcast = AsyncMock()
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
             mock_registry.has.return_value = False
 
             # Should not raise
@@ -319,7 +360,10 @@ class TestProcessApplicationErrors:
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = True
-            mock_settings.return_value = MagicMock(min_ats_score=0.75)
+            mock_settings.return_value = MagicMock(
+                min_ats_score=0.75,
+                feature_flags=MagicMock(tenant_enforcement=False),
+            )
 
             # Return None for job lookup
             mock_session = _make_mock_session(None)

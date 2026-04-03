@@ -21,6 +21,7 @@ from app.core.exceptions import AutoApplyError
 from app.db.redis import get_redis, init_redis_pool
 from app.db.session import async_session_factory
 from app.models.application import Application
+from app.models.job import Job
 from app.models.resume import Resume
 from app.services import resume as resume_service
 from app.services.queue import dequeue
@@ -60,6 +61,7 @@ async def _update_application_status(
     notes: str | None = None,
     ats_score: float | None = None,
     applied_at: datetime | None = None,
+    tenant_id: str | None = None,
 ) -> None:
     """Persist application status changes to the database.
 
@@ -72,12 +74,17 @@ async def _update_application_status(
     """
     try:
         async with async_session_factory() as db:
-            result = await db.execute(
-                select(Application).where(Application.id == app_id),
-            )
+            query = select(Application).where(Application.id == app_id)
+            if tenant_id is not None:
+                query = query.where(Application.tenant_id == tenant_id)
+            result = await db.execute(query)
             app = result.scalar_one_or_none()
             if app is None:
-                logger.warning("worker.app_not_found_for_update", app_id=app_id)
+                logger.warning(
+                    "worker.app_not_found_for_update",
+                    app_id=app_id,
+                    tenant_id=tenant_id,
+                )
                 return
             app.status = status
             if notes is not None:
@@ -177,6 +184,8 @@ async def process_application(payload: dict[str, Any]) -> None:
     app_id: str = payload.get("application_id", "")
     resume_id: str = payload.get("resume_id", "")
     platform_name: str = payload.get("platform", "")
+    tenant_id_raw: str | None = payload.get("tenant_id")
+    tenant_id = tenant_id_raw.strip() if isinstance(tenant_id_raw, str) else tenant_id_raw
 
     logger.info(
         "worker.processing",
@@ -185,8 +194,25 @@ async def process_application(payload: dict[str, Any]) -> None:
         platform=platform_name,
     )
 
+    settings = get_settings()
+    strict_tenant_mode = settings.feature_flags.tenant_enforcement
+    if strict_tenant_mode and not tenant_id:
+        guardrail_msg = "Missing tenant context for execution write path"
+        logger.error(
+            "worker.missing_tenant_context",
+            app_id=app_id,
+            job_id=job_id,
+        )
+        await _broadcast_progress(app_id, ApplicationStatus.FAILED, guardrail_msg)
+        return
+
     transitions = StateTransitionOrchestrator(
-        update_status=_update_application_status,
+        update_status=lambda _app_id, _status, **kwargs: _update_application_status(
+            _app_id,
+            _status,
+            tenant_id=tenant_id,
+            **kwargs,
+        ),
         broadcast_progress=_broadcast_progress,
     )
     verifier = VerificationOrchestrator(
@@ -213,14 +239,13 @@ async def process_application(payload: dict[str, Any]) -> None:
         return
 
     try:
-        settings = get_settings()
         min_score = settings.min_ats_score
 
         # --------------------------------------------------------------
         # Step 1: Load job details from DB
         # --------------------------------------------------------------
         await transitions.progress(app_id, "loading_job")
-        job = await verifier.load_job(job_id)
+        job = await verifier.load_job(job_id, tenant_id=tenant_id)
 
         if job is None:
             error_msg = f"Job {job_id} not found in database"

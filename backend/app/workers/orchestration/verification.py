@@ -37,11 +37,18 @@ class VerificationOrchestrator:
             )
         return VerificationResult(ok=True)
 
-    async def load_job(self, job_id: str) -> Job | None:
+    async def load_job(
+        self,
+        job_id: str,
+        tenant_id: str | None = None,
+    ) -> Job | None:
         """Load job from DB via session factory."""
         try:
             async with self.session_factory() as db:
-                result = await db.execute(select(Job).where(Job.id == job_id))
+                query = select(Job).where(Job.id == job_id)
+                if tenant_id is not None:
+                    query = query.where(Job.tenant_id == tenant_id)
+                result = await db.execute(query)
                 return result.scalar_one_or_none()
         except Exception as exc:
             logger.error("verification.load_job_failed", job_id=job_id, error=str(exc))
