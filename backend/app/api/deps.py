@@ -3,7 +3,7 @@
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
-from fastapi import Header
+from fastapi import Header, HTTPException, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,3 +51,38 @@ async def get_tenant_context(
         actor_id=x_actor_id,
         enforced=enforced,
     )
+
+
+def require_execution_tenant(ctx: TenantContext, tenant_id: str | None = None) -> str | None:
+    """Require tenant context for execution-sensitive paths in strict mode.
+
+    Soft mode remains backward-compatible and allows null tenants.
+    """
+    resolved = tenant_id or ctx.tenant_id
+    if ctx.enforced and not resolved:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant context is required for execution in strict mode.",
+        )
+    return resolved
+
+
+def require_execution_write_tenant(
+    ctx: TenantContext,
+    tenant_id: str | None = None,
+) -> str:
+    """Require tenant context for execution-producing writes in all modes.
+
+    This progressive gate blocks creation of new execution records without
+    tenant ownership even while global strict mode may still be disabled.
+    """
+    resolved = tenant_id or ctx.tenant_id
+    if not resolved:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Tenant context is required for execution-producing writes. "
+                "Provide X-Tenant-Id."
+            ),
+        )
+    return resolved

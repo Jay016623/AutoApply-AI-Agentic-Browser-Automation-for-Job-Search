@@ -175,15 +175,28 @@ async def process_application(payload: dict[str, Any]) -> None:
     app_id: str = payload.get("application_id", "")
     resume_id: str = payload.get("resume_id", "")
     platform_name: str = payload.get("platform", "")
+    payload_tenant_id: str | None = payload.get("tenant_id")
 
     logger.info(
         "worker.processing",
         job_id=job_id,
         app_id=app_id,
         platform=platform_name,
+        tenant_id=payload_tenant_id,
     )
 
     await _broadcast_progress(app_id, ApplicationStatus.APPLYING)
+
+    settings = get_settings()
+    if settings.feature_flags.tenant_enforcement and not payload_tenant_id:
+        detail = "Execution payload missing tenant_id in strict mode."
+        await _update_application_status(
+            app_id,
+            ApplicationStatus.FAILED,
+            notes=detail,
+        )
+        await _broadcast_progress(app_id, ApplicationStatus.FAILED, detail=detail)
+        return
 
     # Validate platform is registered
     if not platform_registry.has(platform_name):
@@ -201,7 +214,6 @@ async def process_application(payload: dict[str, Any]) -> None:
         return
 
     try:
-        settings = get_settings()
         min_score = settings.min_ats_score
 
         # --------------------------------------------------------------
@@ -209,8 +221,16 @@ async def process_application(payload: dict[str, Any]) -> None:
         # --------------------------------------------------------------
         await _broadcast_progress(app_id, "loading_job")
         job: Job | None = None
+        app_tenant_id: str | None = payload_tenant_id
         try:
             async with async_session_factory() as db:
+                app_result = await db.execute(
+                    select(Application).where(Application.id == app_id),
+                )
+                app_row = app_result.scalar_one_or_none()
+                if app_row is not None:
+                    app_tenant_id = app_row.tenant_id or app_tenant_id
+
                 result = await db.execute(
                     select(Job).where(Job.id == job_id),
                 )
@@ -231,6 +251,21 @@ async def process_application(payload: dict[str, Any]) -> None:
             )
             return
 
+        if settings.feature_flags.tenant_enforcement:
+            if not app_tenant_id or not job.tenant_id or app_tenant_id != job.tenant_id:
+                detail = "Tenant mismatch between payload/application/job in strict mode."
+                await _update_application_status(
+                    app_id,
+                    ApplicationStatus.FAILED,
+                    notes=detail,
+                )
+                await _broadcast_progress(
+                    app_id,
+                    ApplicationStatus.FAILED,
+                    detail=detail,
+                )
+                return
+
         # --------------------------------------------------------------
         # Step 2: Generate tailored resume + cover letter
         # --------------------------------------------------------------
@@ -246,7 +281,9 @@ async def process_application(payload: dict[str, Any]) -> None:
                     )
                     tailored_resp = (
                         await resume_service.generate_tailored_resume(
-                            db, gen_request,
+                            db,
+                            gen_request,
+                            tenant_id=app_tenant_id,
                         )
                     )
                     result = await db.execute(

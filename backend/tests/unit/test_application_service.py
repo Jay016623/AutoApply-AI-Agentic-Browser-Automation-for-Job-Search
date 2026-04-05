@@ -1,6 +1,7 @@
 """Unit tests for the application service."""
 
 import pytest
+from unittest.mock import AsyncMock, patch
 
 from app.config.constants import ApplicationStatus
 from app.core.exceptions import RecordNotFoundError
@@ -31,9 +32,34 @@ class TestCreateApplication:
 
         assert app.id is not None
         assert app.job_id == job.id
-        assert app.status == ApplicationStatus.QUEUED
+        assert app.status == ApplicationStatus.PENDING_REVIEW
         assert app.apply_mode == "review"
         assert app.resume_id is None
+
+    async def test_create_application_autonomous_enqueues(self, db_session, sample_job_data):
+        job = await _create_job(db_session, sample_job_data)
+        data = ApplicationCreate(job_id=job.id, apply_mode="autonomous", tenant_id="tenant-1")
+
+        with (
+            patch("app.services.application.get_redis") as mock_get_redis,
+            patch(
+                "app.services.application.enqueue_idempotent",
+                new_callable=AsyncMock,
+            ) as mock_enqueue_idempotent,
+        ):
+            mock_get_redis.return_value = object()
+            mock_enqueue_idempotent.return_value = ("task-1", True)
+            app = await app_service.create_application(db_session, data)
+
+        assert app.execution_task_id == "task-1"
+        assert app.tenant_id == "tenant-1"
+        assert mock_enqueue_idempotent.await_count == 1
+
+    async def test_create_application_autonomous_requires_tenant(self, db_session, sample_job_data):
+        job = await _create_job(db_session, sample_job_data)
+        data = ApplicationCreate(job_id=job.id, apply_mode="autonomous")
+        with pytest.raises(ValueError, match="Tenant context is required for autonomous"):
+            await app_service.create_application(db_session, data)
 
 
 class TestCreateBatch:
@@ -48,6 +74,7 @@ class TestCreateBatch:
         assert len(apps) == 3
         job_ids = {a.job_id for a in apps}
         assert job_ids == {j.id for j in jobs}
+        assert all(a.status == ApplicationStatus.PENDING_REVIEW for a in apps)
 
 
 class TestListApplications:
@@ -80,12 +107,14 @@ class TestListApplications:
         app_obj = await app_service.create_application(
             db_session, ApplicationCreate(job_id=job.id)
         )
-        await app_service.approve_application(db_session, app_obj.id)
+        with patch("app.services.application.get_redis") as mock_get_redis:
+            mock_get_redis.return_value = None
+            await app_service.approve_application(db_session, app_obj.id)
 
         queued = await app_service.list_applications(
             db_session, status=ApplicationStatus.QUEUED
         )
-        assert queued.total == 2
+        assert queued.total == 0
 
         approved = await app_service.list_applications(
             db_session, status=ApplicationStatus.APPROVED
@@ -115,10 +144,79 @@ class TestApproveApplication:
         created = await app_service.create_application(
             db_session, ApplicationCreate(job_id=job.id)
         )
-        assert created.status == ApplicationStatus.QUEUED
+        assert created.status == ApplicationStatus.PENDING_REVIEW
 
-        approved = await app_service.approve_application(db_session, created.id)
+        with patch("app.services.application.get_redis") as mock_get_redis:
+            mock_get_redis.return_value = None
+            approved = await app_service.approve_application(db_session, created.id)
         assert approved.status == ApplicationStatus.APPROVED
+
+    async def test_repeated_approval_does_not_duplicate_enqueue(self, db_session, sample_job_data):
+        job = await _create_job(db_session, sample_job_data)
+        created = await app_service.create_application(
+            db_session,
+            ApplicationCreate(job_id=job.id, tenant_id="tenant-1"),
+        )
+
+        with (
+            patch("app.services.application.get_redis") as mock_get_redis,
+            patch(
+                "app.services.application.enqueue_idempotent",
+                new_callable=AsyncMock,
+            ) as mock_enqueue_idempotent,
+        ):
+            mock_get_redis.return_value = object()
+            mock_enqueue_idempotent.return_value = ("task-repeat", True)
+            first = await app_service.approve_application(
+                db_session,
+                created.id,
+                tenant_id="tenant-1",
+            )
+            second = await app_service.approve_application(
+                db_session,
+                created.id,
+                tenant_id="tenant-1",
+            )
+
+        assert first.execution_task_id == "task-repeat"
+        assert second.execution_task_id == "task-repeat"
+        assert mock_enqueue_idempotent.await_count == 1
+
+    async def test_repeated_approval_uses_stable_task_when_enqueue_suppressed(
+        self, db_session, sample_job_data,
+    ):
+        job = await _create_job(db_session, sample_job_data)
+        created = await app_service.create_application(
+            db_session,
+            ApplicationCreate(job_id=job.id, tenant_id="tenant-1"),
+        )
+
+        with (
+            patch("app.services.application.get_redis") as mock_get_redis,
+            patch(
+                "app.services.application.enqueue_idempotent",
+                new_callable=AsyncMock,
+            ) as mock_enqueue_idempotent,
+        ):
+            mock_get_redis.return_value = object()
+            mock_enqueue_idempotent.return_value = ("task-stable", False)
+            approved = await app_service.approve_application(
+                db_session,
+                created.id,
+                tenant_id="tenant-1",
+            )
+
+        assert approved.execution_task_id == "task-stable"
+        assert approved.status == ApplicationStatus.QUEUED
+
+    async def test_approve_application_requires_tenant_for_execution(self, db_session, sample_job_data):
+        job = await _create_job(db_session, sample_job_data)
+        created = await app_service.create_application(
+            db_session,
+            ApplicationCreate(job_id=job.id),
+        )
+        with pytest.raises(ValueError, match="Tenant context is required for approval"):
+            await app_service.approve_application(db_session, created.id)
 
 
 class TestUpdateStatus:

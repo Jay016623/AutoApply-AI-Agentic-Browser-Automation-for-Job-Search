@@ -15,7 +15,12 @@ class Application(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         Index("ix_application_status", "status"),
         Index("ix_application_job_id", "job_id"),
+        Index("ix_application_tenant", "tenant_id"),
+        Index("ix_application_execution_task", "execution_task_id"),
     )
+
+    # Tenant ownership
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Foreign keys
     job_id: Mapped[str] = mapped_column(
@@ -46,6 +51,7 @@ class Application(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Metadata
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     browser_screenshots: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    execution_task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Relationships
     job: Mapped["Job"] = relationship(back_populates="applications")  # noqa: F821
