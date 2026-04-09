@@ -151,15 +151,16 @@ class TestLLMUsageModel:
 
 
 class TestUserSettingsModel:
-    """Test UserSettings singleton model."""
+    """Test UserSettings tenant-keyed model."""
 
     async def test_create_default_settings(self, db_session: AsyncSession) -> None:
-        """Default user settings should be created with singleton id."""
+        """Default user settings should be created with generated id."""
         settings = UserSettings()
         db_session.add(settings)
         await db_session.commit()
 
-        assert settings.id == "singleton"
+        assert isinstance(settings.id, str)
+        assert len(settings.id) == 32
         assert settings.apply_mode == "review"
         assert settings.max_parallel == 3
         assert settings.min_ats_score == 0.75

@@ -46,6 +46,7 @@ class SettingsResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+    tenant_id: str | None = None
     apply_mode: str = "review"
     min_ats_score: float = 0.75
     max_parallel: int = 3

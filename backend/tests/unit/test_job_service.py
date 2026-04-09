@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app.core.exceptions import RecordNotFoundError
 from app.models.job import Job
@@ -31,7 +32,7 @@ class TestSearchJobs:
             "list_platforms",
             return_value=[],
         ):
-            result = await job_search.search_jobs(db_session, request)
+            result = await job_search.search_jobs(db_session, request, tenant_id="tenant-1")
         assert result.items == []
         assert result.total == 0
         assert result.page == 1
@@ -67,7 +68,7 @@ class TestSearchJobs:
                 return_value=mock_platform,
             ),
         ):
-            result = await job_search.search_jobs(db_session, request)
+            result = await job_search.search_jobs(db_session, request, tenant_id="tenant-1")
 
         assert result.total == 1
         assert result.items[0].title == "Python Dev"
@@ -94,10 +95,15 @@ class TestSearchJobs:
                 return_value=mock_platform,
             ),
         ):
-            result = await job_search.search_jobs(db_session, request)
+            result = await job_search.search_jobs(db_session, request, tenant_id="tenant-1")
 
         assert result.total == 0
         assert result.items == []
+
+    async def test_search_jobs_requires_tenant_for_persisted_write(self, db_session):
+        request = JobSearchRequest(query="python developer", platforms=[])
+        with pytest.raises(ValueError, match="Tenant context is required"):
+            await job_search.search_jobs(db_session, request, tenant_id=None)
 
 
 class TestListJobs:
@@ -194,3 +200,19 @@ class TestAnalyzeJob:
     async def test_analyze_job_not_found_raises(self, db_session):
         with pytest.raises(RecordNotFoundError):
             await job_search.analyze_job(db_session, "nonexistent_id")
+
+
+class TestJobTenantUniqueness:
+    async def test_duplicate_platform_id_allowed_across_tenants(self, db_session, sample_job_data):
+        first = Job(**{**sample_job_data, "tenant_id": "tenant-a"})
+        second = Job(**{**sample_job_data, "tenant_id": "tenant-b"})
+        db_session.add_all([first, second])
+        await db_session.commit()
+        assert first.id != second.id
+
+    async def test_duplicate_platform_id_blocked_within_tenant(self, db_session, sample_job_data):
+        first = Job(**{**sample_job_data, "tenant_id": "tenant-a"})
+        second = Job(**{**sample_job_data, "tenant_id": "tenant-a"})
+        db_session.add_all([first, second])
+        with pytest.raises(IntegrityError):
+            await db_session.commit()

@@ -22,6 +22,7 @@ class JobListingResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    tenant_id: str | None = None
     platform: str
     platform_job_id: str
     title: str

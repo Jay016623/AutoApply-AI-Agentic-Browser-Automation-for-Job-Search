@@ -1,24 +1,27 @@
 """User settings database model."""
 
-from sqlalchemy import JSON, CheckConstraint, Float, Integer, String
+from sqlalchemy import JSON, Float, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base, TimestampMixin
+from app.models.base import Base, TimestampMixin, generate_uuid
 
 
 class UserSettings(TimestampMixin, Base):
-    """User preferences and configuration. Single-row table."""
+    """User preferences and configuration keyed by tenant."""
 
     __tablename__ = "user_settings"
     __table_args__ = (
-        CheckConstraint("id = 'singleton'", name="ck_user_settings_singleton"),
+        Index("ix_user_settings_tenant", "tenant_id"),
+        UniqueConstraint("tenant_id", name="uq_user_settings_tenant"),
     )
 
     id: Mapped[str] = mapped_column(
-        String(20),
+        String(32),
         primary_key=True,
-        default="singleton",
+        default=generate_uuid,
     )
+
+    tenant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Application behavior
     apply_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="review")

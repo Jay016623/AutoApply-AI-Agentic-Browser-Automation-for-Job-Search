@@ -36,6 +36,15 @@ UPLOAD_DIR = Path("data/uploads")
 _parser = DocumentParser()
 
 
+def _require_execution_write_tenant(tenant_id: str | None, *, action: str) -> str:
+    """Require tenant context for execution-relevant resume write operations."""
+    if not tenant_id:
+        raise ValueError(
+            f"Tenant context is required for resume {action} execution-producing writes.",
+        )
+    return tenant_id
+
+
 def _extract_skills_text_based(text: str) -> list[str]:
     """Extract skills using the SkillMatcher text-based approach.
 
@@ -87,6 +96,7 @@ async def upload_resume(
     db: AsyncSession,
     file: UploadFile,
     candidate_id: str | None = None,
+    tenant_id: str | None = None,
 ) -> ResumeUploadResponse:
     """Upload, parse, and store a resume file.
 
@@ -100,6 +110,7 @@ async def upload_resume(
     Returns:
         Upload response with detected metadata.
     """
+    tenant_id = _require_execution_write_tenant(tenant_id, action="upload")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     file_ext = Path(file.filename or "resume.pdf").suffix.lower()
@@ -138,6 +149,7 @@ async def upload_resume(
         skills_detected = _extract_skills(parsed_text)
 
     resume = Resume(
+        tenant_id=tenant_id,
         name=file.filename or "Untitled Resume",
         type="base",
         candidate_id=candidate_id,
@@ -168,7 +180,10 @@ async def upload_resume(
     )
 
 
-async def list_resumes(db: AsyncSession) -> ResumeListResponse:
+async def list_resumes(
+    db: AsyncSession,
+    tenant_id: str | None = None,
+) -> ResumeListResponse:
     """List all resumes.
 
     Args:
@@ -177,24 +192,41 @@ async def list_resumes(db: AsyncSession) -> ResumeListResponse:
     Returns:
         List of all resumes with total count.
     """
-    result = await db.execute(select(Resume).order_by(Resume.created_at.desc()))
+    query = select(Resume).order_by(Resume.created_at.desc())
+    if tenant_id is not None:
+        query = query.where(Resume.tenant_id == tenant_id)
+    result = await db.execute(query)
     resumes = list(result.scalars().all())
     items = [ResumeResponse.model_validate(r) for r in resumes]
     return ResumeListResponse(items=items, total=len(items))
 
 
-async def get_resume(db: AsyncSession, resume_id: str) -> Resume:
+async def get_resume(
+    db: AsyncSession,
+    resume_id: str,
+    tenant_id: str | None = None,
+) -> Resume:
     """Get a resume by ID or raise RecordNotFoundError."""
-    result = await db.execute(select(Resume).where(Resume.id == resume_id))
+    query = select(Resume).where(Resume.id == resume_id)
+    if tenant_id is not None:
+        query = query.where(Resume.tenant_id == tenant_id)
+    result = await db.execute(query)
     resume = result.scalar_one_or_none()
     if resume is None:
         raise RecordNotFoundError("Resume", resume_id)
     return resume
 
 
-async def _get_job(db: AsyncSession, job_id: str) -> Job:
+async def _get_job(
+    db: AsyncSession,
+    job_id: str,
+    tenant_id: str | None = None,
+) -> Job:
     """Get a job by ID or raise RecordNotFoundError."""
-    result = await db.execute(select(Job).where(Job.id == job_id))
+    query = select(Job).where(Job.id == job_id)
+    if tenant_id is not None:
+        query = query.where(Job.tenant_id == tenant_id)
+    result = await db.execute(query)
     job = result.scalar_one_or_none()
     if job is None:
         raise RecordNotFoundError("Job", job_id)
@@ -332,6 +364,7 @@ def _parse_education_section(text: str) -> list[dict]:
 async def generate_tailored_resume(
     db: AsyncSession,
     request: ResumeGenerateRequest,
+    tenant_id: str | None = None,
 ) -> ResumeResponse:
     """Generate a tailored resume for a specific job using LLM.
 
@@ -345,8 +378,9 @@ async def generate_tailored_resume(
     Returns:
         The generated tailored resume response.
     """
-    base = await get_resume(db, request.base_resume_id)
-    job = await _get_job(db, request.job_id)
+    tenant_id = _require_execution_write_tenant(tenant_id, action="generation")
+    base = await get_resume(db, request.base_resume_id, tenant_id=tenant_id)
+    job = await _get_job(db, request.job_id, tenant_id=tenant_id)
 
     # Build structured data from base resume text
     resume_data = _build_resume_data_from_text(base.content_text or "")
@@ -363,6 +397,7 @@ async def generate_tailored_resume(
 
     # Create the tailored resume record
     tailored = Resume(
+        tenant_id=tenant_id or base.tenant_id,
         name=f"Tailored - {base.name}",
         type="tailored",
         template_id=request.template_id,
@@ -416,7 +451,7 @@ async def _create_resume_version(
     next_version = (latest.version + 1) if latest is not None else 1
 
     version = ResumeVersion(
-        tenant_id=None,
+        tenant_id=resume.tenant_id,
         candidate_id=candidate_id,
         resume_id=resume.id,
         job_id=resume.job_id,
@@ -437,6 +472,7 @@ async def score_resume(
     db: AsyncSession,
     resume_id: str,
     request: ResumeScoreRequest,
+    tenant_id: str | None = None,
 ) -> ResumeScoreResponse:
     """Score a resume against a job listing using multi-factor ATS analysis.
 
@@ -452,8 +488,8 @@ async def score_resume(
     Returns:
         Detailed ATS score breakdown.
     """
-    resume = await get_resume(db, resume_id)
-    job = await _get_job(db, request.job_id)
+    resume = await get_resume(db, resume_id, tenant_id=tenant_id)
+    job = await _get_job(db, request.job_id, tenant_id=tenant_id)
 
     resume_text = resume.content_text or ""
     job_description = job.description or ""
@@ -598,6 +634,7 @@ async def optimize_resume(
     db: AsyncSession,
     resume_id: str,
     job_id: str | None = None,
+    tenant_id: str | None = None,
 ) -> ResumeResponse:
     """Optimize a resume for ATS compatibility using LLM rewriting.
 
@@ -613,18 +650,19 @@ async def optimize_resume(
     Returns:
         The newly created optimized resume.
     """
-    resume = await get_resume(db, resume_id)
+    tenant_id = _require_execution_write_tenant(tenant_id, action="optimization")
+    resume = await get_resume(db, resume_id, tenant_id=tenant_id)
     target_job_id = job_id or resume.job_id
     if not target_job_id:
         raise RecordNotFoundError("Job", "none (no job_id provided)")
 
-    job = await _get_job(db, target_job_id)
+    job = await _get_job(db, target_job_id, tenant_id=tenant_id)
     resume_text = resume.content_text or ""
     job_description = job.description or ""
 
     # Score the resume to get detailed breakdown
     score_result = await score_resume(
-        db, resume_id, ResumeScoreRequest(job_id=target_job_id),
+        db, resume_id, ResumeScoreRequest(job_id=target_job_id), tenant_id=tenant_id,
     )
 
     # Get optimizer suggestions
@@ -688,6 +726,7 @@ async def optimize_resume(
 
     # Create new optimized resume record
     optimized = Resume(
+        tenant_id=tenant_id or resume.tenant_id,
         name=f"Optimized - {resume.name}",
         type="optimized",
         template_id=resume.template_id,
@@ -705,7 +744,10 @@ async def optimize_resume(
     # Re-score the optimized resume
     try:
         new_score = await score_resume(
-            db, optimized.id, ResumeScoreRequest(job_id=target_job_id),
+            db,
+            optimized.id,
+            ResumeScoreRequest(job_id=target_job_id),
+            tenant_id=tenant_id,
         )
         optimized.ats_score = new_score.overall_score
         await db.commit()

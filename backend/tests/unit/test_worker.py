@@ -27,6 +27,9 @@ def _make_payload(
         "application_id": application_id,
         "platform": platform,
         "resume_id": resume_id,
+        "tenant_id": "tenant-1",
+        "execution_task_id": "task-1",
+        "enqueue_reason": "approve",
     }
 
 
@@ -44,6 +47,9 @@ def _make_mock_job():
     job.job_type = "full-time"
     job.remote = True
     job.skills_required = {"skills": ["python"]}
+    job.tenant_id = "tenant-1"
+    job.execution_task_id = "task-1"
+    job.resume_id = None
     return job
 
 
@@ -78,6 +84,22 @@ class TestProcessApplicationHappyPath:
                 "app.workers.application_worker.ws_manager",
             ) as mock_ws,
             patch(
+                "app.workers.application_worker.visibility_service.start_attempt",
+                new_callable=AsyncMock,
+            ) as mock_start_attempt,
+            patch(
+                "app.workers.application_worker.visibility_service.start_step",
+                new_callable=AsyncMock,
+            ) as mock_start_step,
+            patch(
+                "app.workers.application_worker.visibility_service.complete_step",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.workers.application_worker.visibility_service.finalize_attempt",
+                new_callable=AsyncMock,
+            ) as mock_finalize_attempt,
+            patch(
                 "app.workers.application_worker.platform_registry",
             ) as mock_registry,
             patch(
@@ -95,6 +117,8 @@ class TestProcessApplicationHappyPath:
             mock_registry.has.return_value = True
             mock_registry.create.return_value = mock_platform
             mock_settings.return_value = MagicMock(min_ats_score=0.75)
+            mock_start_attempt.return_value = MagicMock(id="attempt-1")
+            mock_start_step.return_value = MagicMock(id="step-1")
 
             mock_session = _make_mock_session(mock_job)
             mock_sf.return_value.__aenter__ = AsyncMock(
@@ -103,6 +127,10 @@ class TestProcessApplicationHappyPath:
             mock_sf.return_value.__aexit__ = AsyncMock(return_value=False)
 
             await process_application(payload)
+
+        assert mock_start_attempt.await_count >= 1
+        assert mock_start_step.await_count >= 1
+        assert mock_finalize_attempt.await_count >= 1
 
         # Verify progress broadcasts happened in order
         broadcast_calls = mock_ws.broadcast.call_args_list
@@ -127,6 +155,22 @@ class TestProcessApplicationHappyPath:
             patch(
                 "app.workers.application_worker.ws_manager",
             ) as mock_ws,
+            patch(
+                "app.workers.application_worker.visibility_service.start_attempt",
+                new_callable=AsyncMock,
+            ) as mock_start_attempt,
+            patch(
+                "app.workers.application_worker.visibility_service.start_step",
+                new_callable=AsyncMock,
+            ) as mock_start_step,
+            patch(
+                "app.workers.application_worker.visibility_service.fail_step",
+                new_callable=AsyncMock,
+            ) as mock_fail_step,
+            patch(
+                "app.workers.application_worker.visibility_service.finalize_attempt",
+                new_callable=AsyncMock,
+            ) as mock_finalize_attempt,
             patch(
                 "app.workers.application_worker.platform_registry",
             ) as mock_registry,
@@ -169,6 +213,22 @@ class TestProcessApplicationErrors:
                 "app.workers.application_worker.ws_manager",
             ) as mock_ws,
             patch(
+                "app.workers.application_worker.visibility_service.start_attempt",
+                new_callable=AsyncMock,
+            ) as mock_start_attempt,
+            patch(
+                "app.workers.application_worker.visibility_service.start_step",
+                new_callable=AsyncMock,
+            ) as mock_start_step,
+            patch(
+                "app.workers.application_worker.visibility_service.fail_step",
+                new_callable=AsyncMock,
+            ) as mock_fail_step,
+            patch(
+                "app.workers.application_worker.visibility_service.finalize_attempt",
+                new_callable=AsyncMock,
+            ) as mock_finalize_attempt,
+            patch(
                 "app.workers.application_worker.platform_registry",
             ) as mock_registry,
             patch(
@@ -178,6 +238,8 @@ class TestProcessApplicationErrors:
         ):
             mock_ws.broadcast = AsyncMock()
             mock_registry.has.return_value = False
+            mock_start_attempt.return_value = MagicMock(id="attempt-1")
+            mock_start_step.return_value = MagicMock(id="step-1")
 
             await process_application(payload)
 
@@ -185,6 +247,8 @@ class TestProcessApplicationErrors:
         msg = last_call.args[0]
         assert msg["status"] == ApplicationStatus.FAILED
         assert "unknown_platform" in msg.get("detail", "").lower()
+        assert mock_fail_step.await_count >= 1
+        assert mock_finalize_attempt.await_count >= 1
 
     async def test_worker_handles_empty_payload(self):
         """Worker should handle an empty payload without crashing."""

@@ -34,6 +34,7 @@ class ApplicationCreate(BaseModel):
 
     job_id: str
     resume_id: str | None = None
+    tenant_id: str | None = None
     apply_mode: ApplyModeEnum = ApplyModeEnum.REVIEW
 
 
@@ -42,6 +43,7 @@ class ApplicationBatchCreate(BaseModel):
 
     job_ids: list[str] = Field(..., min_length=1)
     resume_id: str | None = None
+    tenant_id: str | None = None
     apply_mode: ApplyModeEnum = ApplyModeEnum.REVIEW
 
 
@@ -58,6 +60,7 @@ class ApplicationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    tenant_id: str | None = None
     job_id: str
     resume_id: str | None = None
     status: str
@@ -67,6 +70,7 @@ class ApplicationResponse(BaseModel):
     applied_at: datetime | None = None
     response_date: datetime | None = None
     notes: str | None = None
+    execution_task_id: str | None = None
     created_at: datetime
     updated_at: datetime
 

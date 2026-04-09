@@ -10,6 +10,7 @@ class ResumeUploadResponse(BaseModel):
     """Response after uploading a resume file."""
 
     id: str
+    tenant_id: str | None = None
     name: str
     file_format: str
     word_count: int
